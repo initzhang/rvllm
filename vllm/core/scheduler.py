@@ -844,6 +844,7 @@ class Scheduler:
         force_preemption_count = 0
 
         if waiting_queue:
+            #print(f"%%%xzhanggb%%%, have waiting queue")
             seq_group = waiting_queue.popleft()
             num_new_seqs = seq_group.get_max_num_running_seqs()
             num_new_tokens_uncached, _ = (
@@ -854,6 +855,7 @@ class Scheduler:
             while running_queue and self._get_priority(
                     running_queue[-1]) > self._get_priority(seq_group):
                 #Only preempt if waiting sequence cannot be allocated
+                #print(f"%%%xzhanggb%%%, inversion!!!")
                 can_allocate = self.block_manager.can_allocate(seq_group)
                 if (num_new_tokens_uncached > 0
                         and can_allocate == AllocStatus.OK
@@ -861,6 +863,7 @@ class Scheduler:
                             num_new_tokens=num_new_tokens_uncached,
                             num_new_seqs=num_new_seqs,
                         )):
+                    #print(f"%%%xzhanggb%%%, inversion break")
                     break
 
                 #Adjust budget to remove the victim sequence group
@@ -885,6 +888,8 @@ class Scheduler:
 
         self.waiting = waiting_queue
         self.running = running_queue
+        logger.info(f" force_preemption_count={force_preemption_count}")
+        #logger.info(f" waiting={len(self.waiting)}, running={len(self.running)}")
         return force_preemption_count
 
     def _schedule_prefills(
@@ -1051,6 +1056,7 @@ class Scheduler:
         decodes. If there's a pressure on GPU memory, decode requests can
         be swapped or preempted.
         """
+        logger.info("%"*30+"xzhanggb"+"%"*30)
         # Include running requests to the budget.
         budget = SchedulingBudget(
             token_budget=self.scheduler_config.max_num_batched_tokens,
@@ -1071,18 +1077,31 @@ class Scheduler:
 
         # If any requests are swapped, prioritized swapped requests.
         if not self.swapped:
+            logger.info(f"no swapped, enter _schedule_prefills")
             prefills = self._schedule_prefills(budget,
                                                curr_loras,
                                                enable_chunking=False)
+        else:
+            logger.info(f"have swapped={len(self.swapped)}, not enter _schedule_prefills")
 
         if len(prefills.seq_groups
                ) == 0 and self.scheduler_config.policy == "priority":
+            logger.info(f"no prefill, enter _schedule_priority_preemption")
             self._schedule_priority_preemption(budget)
+            ##### added by xzhanggb START
+            assert not self.swapped
+            prefills = self._schedule_prefills(budget,
+                                               curr_loras,
+                                               enable_chunking=False)
+            ##### added by xzhanggb END
+        else:
+            logger.info(f"have prefill={len(prefills.seq_groups)} prefill, not enter _schedule_priority_preemption")
 
         # Don't schedule decodes if prefills are scheduled.
         # NOTE: If `_schedule_prefills` doesn't enable chunking, self.running
         # only contains decode requests, not chunked prefills.
         if len(prefills.seq_groups) == 0:
+            logger.info(f"prefills.seq_groups=0, decode!")
             running_scheduled = self._schedule_running(budget,
                                                        curr_loras,
                                                        enable_chunking=False)
@@ -1092,6 +1111,8 @@ class Scheduler:
             if len(running_scheduled.preempted) + len(
                     running_scheduled.swapped_out) == 0:
                 swapped_in = self._schedule_swapped(budget, curr_loras)
+        else:
+            logger.info(f"prefills.seq_groups={len(prefills.seq_groups)}, no decode")
 
         assert (budget.num_batched_tokens <=
                 self.scheduler_config.max_num_batched_tokens)
@@ -1134,6 +1155,7 @@ class Scheduler:
         ignored_seq_groups = prefills.ignored_seq_groups
         ignored_seq_groups.extend(swapped_in.infeasible_seq_groups)
 
+        logger.info(f"prefill={num_prefill_groups}, running={len(self.running)}, waiting={len(self.waiting)}")
         return SchedulerOutputs(
             scheduled_seq_groups=scheduled_seq_groups,
             num_prefill_groups=num_prefill_groups,

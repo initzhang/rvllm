@@ -480,7 +480,7 @@ class _AsyncLLMEngine(LLMEngine):
         if lora_request is not None and not self.lora_config:
             raise ValueError(f"Got lora_request {lora_request} but LoRA is "
                              "not enabled!")
-        if priority != 0 and not self.scheduler_config.policy == "priority":
+        if priority != 0 and self.scheduler_config.policy == "fcfs":
             raise ValueError(f"Got priority {priority} but "
                              "Priority scheduling is not enabled.")
         if arrival_time is None:
@@ -970,8 +970,7 @@ class AsyncLLMEngine(EngineClient):
                     "error that caused the background loop to stop "
                     "(AsyncEngineDeadError).")
 
-        if (priority != 0
-                and not self.engine.scheduler_config.policy == "priority"):
+        if (priority != 0 and self.engine.scheduler_config.policy == "fcfs"):
             raise ValueError(f"Got priority {priority} but "
                              "Priority scheduling is not enabled.")
 

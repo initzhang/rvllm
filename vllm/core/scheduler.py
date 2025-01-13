@@ -1069,11 +1069,11 @@ class Scheduler:
 
         first determine prefill, then determine decode
         """
-        if self.scheduler_config.policy == 'fcfs':
+        if self.scheduler_config.policy in ['fcfs', 'priority']:
             return self._schedule_default_old()
 
         logger.info("%"*30+"xzhanggb"+"%"*30)
-        assert self.scheduler_config.policy == 'priority'
+        assert self.scheduler_config.policy in ['priority_full_preempt', 'priority_no_preempt']
         assert not self.lora_enabled
         assert not self.swapped
         curr_loras = None
@@ -1103,21 +1103,25 @@ class Scheduler:
                                            curr_loras,
                                            enable_chunking=False)
 
-        # then check whether still need to preempt
-        later_prefills = []
-        accum_preempt = 0
-        while self.running and self.waiting and self._get_priority(self.running[-1]) > self._get_priority(self.waiting[0]):
-            cur_preempt = self._schedule_priority_preemption(budget)
-            accum_preempt += cur_preempt
-            logger.info(f"iterative preempt {cur_preempt}")
-            # the _schedule_prefills does not add self.running, but only change budget and self.waiting
-            cur_prefills = self._schedule_prefills(budget, 
-                                               curr_loras, 
-                                               enable_chunking=False)
-            later_prefills.append(cur_prefills)
-
-        prefills = self._combine_prefills([initial_prefills]+later_prefills)
-        logger.info(f"total preemption: {accum_preempt}")
+        if self.scheduler_config.policy == "priority_full_preempt":
+            # then check whether still need to preempt
+            later_prefills = []
+            accum_preempt = 0
+            while self.running and self.waiting and self._get_priority(self.running[-1]) > self._get_priority(self.waiting[0]):
+                cur_preempt = self._schedule_priority_preemption(budget)
+                accum_preempt += cur_preempt
+                logger.info(f"iterative preempt {cur_preempt}")
+                # the _schedule_prefills does not add self.running, but only change budget and self.waiting
+                cur_prefills = self._schedule_prefills(budget, 
+                                                   curr_loras, 
+                                                   enable_chunking=False)
+                later_prefills.append(cur_prefills)
+            prefills = self._combine_prefills([initial_prefills]+later_prefills)
+            logger.info(f"total preemption: {accum_preempt}")
+        else:
+            # priority_no_preempt
+            logger.info(f"priority with no preemption")
+            prefills = initial_prefills
         
         # Don't schedule decodes if prefills are scheduled.
         # NOTE: If `_schedule_prefills` doesn't enable chunking, self.running
@@ -1195,6 +1199,7 @@ class Scheduler:
 
     def _schedule_default_old(self) -> SchedulerOutputs:
         """Schedule queued requests.
+        weird [priority + partial preempt] implementation of vllm
         
         The current policy is designed to optimize the throughput. First,
         it batches as many prefill requests as possible. And it schedules

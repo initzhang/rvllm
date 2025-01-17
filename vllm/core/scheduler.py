@@ -2,7 +2,7 @@ import enum
 import os
 import random
 import time
-from collections import deque
+from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, Iterable, List, Optional
 from typing import Sequence as GenericSequence
@@ -1059,6 +1059,17 @@ class Scheduler:
             self.prev_prompt = True
         return out_prefills
 
+    def agg_query_dict(self):
+        running_queries = defaultdict(list)
+        waiting_queries = defaultdict(list)
+        for sg in self.running:
+            running_queries[sg.priority].append(sg)
+
+        for sg in self.waiting:
+            waiting_queries[sg.priority].append(sg)
+
+        return running_queries, waiting_queries
+
     def _schedule_default(self) -> SchedulerOutputs:
         """Schedule queued requests.
         
@@ -1087,6 +1098,8 @@ class Scheduler:
         # sort two queues based on priority
         self.running = deque(sorted(self.running, key=self._get_priority))
         self.waiting = deque(sorted(self.waiting, key=self._get_priority))
+
+        old_running_queries, old_waiting_queries = self.agg_query_dict()
 
         # Make sure we include num running seqs before scheduling prefill,
         # so that we don't schedule beyond max_num_seqs for prefill.
@@ -1118,6 +1131,29 @@ class Scheduler:
                 later_prefills.append(cur_prefills)
             prefills = self._combine_prefills([initial_prefills]+later_prefills)
             logger.info(f"total preemption: {accum_preempt}")
+
+            if accum_preempt > 0:
+                new_running_queries, new_waiting_queries = self.agg_query_dict()
+                evicted_queries_prio = set(old_running_queries.keys()) - set(new_running_queries.keys())
+                logger.info(f"$$$$ evict {len(evicted_queries_prio)} relational query")
+                for pe in evicted_queries_prio:
+                    """
+                    sg.sampling_params.max_tokens
+                    sg[0].get_prompt_len()
+                    sg[0].get_output_len()
+                    """
+                    orig_total_tokens = pe
+                    preempt_tokens = 0
+                    waiting_tokens = 0
+                    for sg in new_waiting_queries[pe]:
+                        preempt_tokens += sg.get_seqs()[0].get_prompt_len()
+                        preempt_tokens += sg.sampling_params.max_tokens
+
+                    for sg in old_waiting_queries[pe]:
+                        waiting_tokens += sg.get_seqs()[0].get_prompt_len()
+                        waiting_tokens += sg.sampling_params.max_tokens
+                    logger.info(f"$$$$ query: {orig_total_tokens}, preempt {preempt_tokens}, waiting {waiting_tokens}")
+                    logger.info(f"$$$$ preempt/total {preempt_tokens/orig_total_tokens:.2f}, waiting/total {waiting_tokens/orig_total_tokens:.2f}")
         else:
             # priority_no_preempt
             logger.info(f"priority with no preemption")

@@ -1084,39 +1084,136 @@ class Scheduler:
             return self._schedule_default_old()
 
         logger.info("%"*30+"xzhanggb"+"%"*30)
-        assert self.scheduler_config.policy in ['priority_full_preempt', 'priority_no_preempt']
+        assert self.scheduler_config.policy in ['priority_full_preempt', 'priority_no_preempt', 'priority_ada_preempt']
         assert not self.lora_enabled
         assert not self.swapped
         curr_loras = None
 
-        # Include running requests to the budget.
-        budget = SchedulingBudget(
-            token_budget=self.scheduler_config.max_num_batched_tokens,
-            max_num_seqs=self.scheduler_config.max_num_seqs,
-        )
+        if self.scheduler_config.policy == "priority_ada_preempt":
+            """
+            for the running queue, we do not modify it at all
+            but we will check the waiting requests belonging to the same running query
+            if remaining requests are little, we will put them ahead of other 
+            queries with higher priority in the waiting queue
 
-        # sort two queues based on priority
-        self.running = deque(sorted(self.running, key=self._get_priority))
-        self.waiting = deque(sorted(self.waiting, key=self._get_priority))
+            process:
+            * agg running and waiting requests based on query 
+            * for each running query, check their remaining workload in waiting queue
+            * if remaining tokens / total tokens < threshold, prioritize remaining requests
+            * the rest of waiting queries are sorted based on their original priority
+            """
+            running_queries, waiting_queries = self.agg_query_dict()
+            supercede_queries = []
 
-        old_running_queries, old_waiting_queries = self.agg_query_dict()
+            for q_prio in running_queries.keys():
+                if q_prio not in waiting_queries.keys():
+                    break
+                total_tokens = q_prio
+                waiting_tokens = 0
+                running_tokens = 0
+                for sg in waiting_queries[q_prio]:
+                    waiting_tokens += sg.sampling_params.max_tokens
+                    waiting_tokens += sg.get_seqs()[0].get_prompt_len()
+                for sg in running_queries[q_prio]:
+                    running_tokens += sg.sampling_params.max_tokens
+                    running_tokens += sg.get_seqs()[0].get_prompt_len()
+                if waiting_tokens / q_prio > 0.1 or running_tokens / q_prio > 0.1:
+                    # too much leftover work, should preempt
+                    continue
+                # run the current query to end first
+                logger.info(f"supercede query: {q_prio}, running/total {running_tokens/q_prio:.2f}, waiting/total {waiting_tokens/q_prio:.2f}")
+                supercede_queries.append(q_prio)
 
-        # Make sure we include num running seqs before scheduling prefill,
-        # so that we don't schedule beyond max_num_seqs for prefill.
-        for seq_group in self.running:
-            budget.add_num_seqs(seq_group.request_id,
-                                seq_group.get_max_num_running_seqs())
+            if len(supercede_queries) == 0:
+                # simply sort 
+                self.waiting = deque(sorted(self.waiting, key=self._get_priority))
+            else:
+                # order waiting requests
+                front_waiting = [sg for sg in self.waiting if sg.priority in supercede_queries]
+                back_waiting = [sg for sg in self.waiting if sg.priority not in supercede_queries]
+                front_waiting = sorted(front_waiting, key=self._get_priority)
+                back_waiting = sorted(back_waiting, key=self._get_priority)
+                self.waiting = deque(front_waiting + back_waiting)
 
-        prefills = SchedulerPrefillOutputs.create_empty()
-        running_scheduled = SchedulerRunningOutputs.create_empty()
-        swapped_in = SchedulerSwappedInOutputs.create_empty()
+            # Include running requests to the budget.
+            budget = SchedulingBudget(
+                token_budget=self.scheduler_config.max_num_batched_tokens,
+                max_num_seqs=self.scheduler_config.max_num_seqs,
+            )
 
-        # first try prefill without preemption
-        initial_prefills = self._schedule_prefills(budget,
-                                           curr_loras,
-                                           enable_chunking=False)
+            # Make sure we include num running seqs before scheduling prefill,
+            # so that we don't schedule beyond max_num_seqs for prefill.
+            for seq_group in self.running:
+                budget.add_num_seqs(seq_group.request_id,
+                                    seq_group.get_max_num_running_seqs())
 
-        if self.scheduler_config.policy == "priority_full_preempt":
+            prefills = SchedulerPrefillOutputs.create_empty()
+            running_scheduled = SchedulerRunningOutputs.create_empty()
+            swapped_in = SchedulerSwappedInOutputs.create_empty()
+
+            # prefill without preemption
+            prefills = self._schedule_prefills(budget,
+                                               curr_loras,
+                                               enable_chunking=False)
+
+        elif self.scheduler_config.policy == "priority_no_preempt" :
+            """
+            for the running query, we do not preempt them
+            and we will always sort waiting queries based on the priority
+            """
+            # Include running requests to the budget.
+            budget = SchedulingBudget(
+                token_budget=self.scheduler_config.max_num_batched_tokens,
+                max_num_seqs=self.scheduler_config.max_num_seqs,
+            )
+
+            # Make sure we include num running seqs before scheduling prefill,
+            # so that we don't schedule beyond max_num_seqs for prefill.
+            for seq_group in self.running:
+                budget.add_num_seqs(seq_group.request_id,
+                                    seq_group.get_max_num_running_seqs())
+
+            prefills = SchedulerPrefillOutputs.create_empty()
+            running_scheduled = SchedulerRunningOutputs.create_empty()
+            swapped_in = SchedulerSwappedInOutputs.create_empty()
+
+            # prefill without preemption
+            prefills = self._schedule_prefills(budget,
+                                               curr_loras,
+                                               enable_chunking=False)
+        else:
+            """
+            priority_full_preempt
+            we will actively reorganize all running and waiting queries
+            to make sure the running ones have highest priority
+            """
+            # Include running requests to the budget.
+            budget = SchedulingBudget(
+                token_budget=self.scheduler_config.max_num_batched_tokens,
+                max_num_seqs=self.scheduler_config.max_num_seqs,
+            )
+
+            # sort two queues based on priority
+            self.running = deque(sorted(self.running, key=self._get_priority))
+            self.waiting = deque(sorted(self.waiting, key=self._get_priority))
+
+            old_running_queries, old_waiting_queries = self.agg_query_dict()
+
+            # Make sure we include num running seqs before scheduling prefill,
+            # so that we don't schedule beyond max_num_seqs for prefill.
+            for seq_group in self.running:
+                budget.add_num_seqs(seq_group.request_id,
+                                    seq_group.get_max_num_running_seqs())
+
+            prefills = SchedulerPrefillOutputs.create_empty()
+            running_scheduled = SchedulerRunningOutputs.create_empty()
+            swapped_in = SchedulerSwappedInOutputs.create_empty()
+
+            # first try prefill without preemption
+            initial_prefills = self._schedule_prefills(budget,
+                                               curr_loras,
+                                               enable_chunking=False)
+
             # then check whether still need to preempt
             later_prefills = []
             accum_preempt = 0
@@ -1132,6 +1229,7 @@ class Scheduler:
             prefills = self._combine_prefills([initial_prefills]+later_prefills)
             logger.info(f"total preemption: {accum_preempt}")
 
+            # print preempt statistics
             if accum_preempt > 0:
                 new_running_queries, new_waiting_queries = self.agg_query_dict()
                 evicted_queries_prio = set(old_running_queries.keys()) - set(new_running_queries.keys())
@@ -1154,11 +1252,12 @@ class Scheduler:
                         waiting_tokens += sg.sampling_params.max_tokens
                     logger.info(f"$$$$ query: {orig_total_tokens}, preempt {preempt_tokens}, waiting {waiting_tokens}")
                     logger.info(f"$$$$ preempt/total {preempt_tokens/orig_total_tokens:.2f}, waiting/total {waiting_tokens/orig_total_tokens:.2f}")
-        else:
-            # priority_no_preempt
-            logger.info(f"priority with no preemption")
-            prefills = initial_prefills
         
+
+        ##################################
+        # logic below is not modified
+        ##################################
+
         # Don't schedule decodes if prefills are scheduled.
         # NOTE: If `_schedule_prefills` doesn't enable chunking, self.running
         # only contains decode requests, not chunked prefills.

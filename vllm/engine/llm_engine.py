@@ -585,11 +585,13 @@ class LLMEngine:
         prompt_adapter_request: Optional[PromptAdapterRequest],
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
+        rel_id: int = -1
     ) -> Optional[SequenceGroup]:
         """Add a processed request to the engine's request pool.
         return the created sequence group.
         """
         if isinstance(params, SamplingParams) and params.n > 1:
+            raise NotImplementedError
             ParallelSampleSequenceGroup.add_request(
                 request_id,
                 self,
@@ -634,8 +636,10 @@ class LLMEngine:
                 trace_headers=trace_headers,
                 prompt_adapter_request=prompt_adapter_request,
                 encoder_seq=encoder_seq,
-                priority=priority)
+                priority=priority,
+                rel_id=rel_id)
         elif isinstance(params, PoolingParams):
+            raise NotImplementedError
             seq_group = self._create_sequence_group_with_pooling(
                 request_id,
                 seq,
@@ -673,6 +677,7 @@ class LLMEngine:
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        rel_id: int = -1,
     ) -> None:
         ...
 
@@ -689,6 +694,7 @@ class LLMEngine:
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        rel_id: int = -1,
     ) -> None:
         ...
 
@@ -706,6 +712,7 @@ class LLMEngine:
             trace_headers: Optional[Mapping[str, str]] = None,
             prompt_adapter_request: Optional[PromptAdapterRequest] = None,
             priority: int = 0,
+            rel_id: int = -1,
             *,
             inputs: Optional[PromptType] = None,  # DEPRECATED
     ) -> None:
@@ -796,6 +803,7 @@ class LLMEngine:
             prompt_adapter_request=prompt_adapter_request,
             trace_headers=trace_headers,
             priority=priority,
+            rel_id=rel_id,
         )
 
     def _validate_token_prompt(self, prompt: PromptType,
@@ -830,6 +838,7 @@ class LLMEngine:
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         encoder_seq: Optional[Sequence] = None,
         priority: int = 0,
+        rel_id: int = -1
     ) -> SequenceGroup:
         """Creates a SequenceGroup with SamplingParams."""
         max_logprobs = self.get_model_config().max_logprobs
@@ -860,7 +869,8 @@ class LLMEngine:
             trace_headers=trace_headers,
             prompt_adapter_request=prompt_adapter_request,
             encoder_seq=encoder_seq,
-            priority=priority)
+            priority=priority,
+            rel_id=rel_id)
 
         return seq_group
 

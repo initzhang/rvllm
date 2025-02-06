@@ -1102,6 +1102,9 @@ class Scheduler:
             * if remaining tokens / total tokens < threshold, prioritize remaining requests
             * the rest of waiting queries are sorted based on their original priority
             """
+            #if self.running or self.waiting:
+            #    probe = self.running + self.waiting
+            #    logger.info(f"{probe[0].rel_id, probe[0].priority}")
             running_queries, waiting_queries = self.agg_query_dict()
             supercede_queries = []
 

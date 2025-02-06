@@ -147,12 +147,16 @@ class OpenAIServingCompletion(OpenAIServing):
                                  self._get_trace_headers(raw_request.headers))
 
                 if isinstance(sampling_params, BeamSearchParams):
+                    raise NotImplementedError
                     generator = self.engine_client.beam_search(
                         prompt=engine_prompt,
                         request_id=request_id,
                         params=sampling_params,
                     )
                 else:
+                    #logger.info(f"when generating have rel_id: {request.rel_id}")
+                    #logger.info(self.engine_client)
+                    #logger.info(type(self.engine_client))
                     generator = self.engine_client.generate(
                         engine_prompt,
                         sampling_params,
@@ -161,6 +165,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         prompt_adapter_request=prompt_adapter_request,
                         trace_headers=trace_headers,
                         priority=request.priority,
+                        rel_id=request.rel_id
                     )
 
                 generators.append(generator)

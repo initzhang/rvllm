@@ -653,6 +653,7 @@ class SequenceGroup:
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        rel_id: int = -1
     ) -> None:
         self.request_id = request_id
         self.seqs = seqs
@@ -676,6 +677,7 @@ class SequenceGroup:
         self.encoder_seq = encoder_seq
         self.trace_headers = trace_headers
         self.priority = priority
+        self.rel_id = rel_id
 
         self.cached_request_output = None
 

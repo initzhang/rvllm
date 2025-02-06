@@ -714,6 +714,11 @@ class CompletionRequest(OpenAIBaseModel):
             "arguments. For example: {'qualname': "
             "'my_module.MyLogitsProcessor', 'args': [1, 2], 'kwargs': "
             "{'param': 'value'}}."))
+    rel_id: int = Field(
+        default=-1,
+        description=(
+            "Added for relational LLM serving optimization"
+            "Requests with the same rel_id belong to the same relQuery"))
 
     # doc: end-completion-extra-params
 

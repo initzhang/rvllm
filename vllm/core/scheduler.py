@@ -1070,6 +1070,34 @@ class Scheduler:
 
         return running_queries, waiting_queries
 
+    def update_query_priority(self):
+        """
+        very simple logic: only update for the waiting queries
+        need to build a performance model to predict waiting cost
+        cost = f(input tokens, output tokens)
+        """
+        waiting_queries = defaultdict(list)
+        for sg in self.waiting:
+            waiting_queries[sg.rel_id].append(sg)
+
+        record_relid_cost = []
+        for rel_id, sg_list in waiting_queries.items():
+            cost = 0
+            for sg in sg_list:
+                # output tokens
+                cost += 1 * sg.sampling_params.max_tokens
+                # input tokens
+                cost += 1 * sg.get_seqs()[0].get_prompt_len()
+            for sg in sg_list:
+                sg.priority = cost
+            record_relid_cost.append((rel_id, cost))
+
+        #self.waiting = deque(sorted(self.waiting, key=self._get_priority))
+        new_waiting = []
+        for rel_id, _ in sorted(record_relid_cost, key=lambda x:x[1]):
+            new_waiting += waiting_queries[rel_id]
+        self.waiting = deque(new_waiting)
+     
     def _schedule_default(self) -> SchedulerOutputs:
         """Schedule queued requests.
         
@@ -1101,10 +1129,10 @@ class Scheduler:
             * for each running query, check their remaining workload in waiting queue
             * if remaining tokens / total tokens < threshold, prioritize remaining requests
             * the rest of waiting queries are sorted based on their original priority
+            
+            deprecated for now
             """
-            #if self.running or self.waiting:
-            #    probe = self.running + self.waiting
-            #    logger.info(f"{probe[0].rel_id, probe[0].priority}")
+            raise NotImplementedError
             running_queries, waiting_queries = self.agg_query_dict()
             supercede_queries = []
 
@@ -1170,6 +1198,9 @@ class Scheduler:
                 max_num_seqs=self.scheduler_config.max_num_seqs,
             )
 
+            # update waiting requests' priority
+            self.update_query_priority()
+
             # Make sure we include num running seqs before scheduling prefill,
             # so that we don't schedule beyond max_num_seqs for prefill.
             for seq_group in self.running:
@@ -1189,7 +1220,10 @@ class Scheduler:
             priority_full_preempt
             we will actively reorganize all running and waiting queries
             to make sure the running ones have highest priority
+
+            deprecated for now
             """
+            raise NotImplementedError
             # Include running requests to the budget.
             budget = SchedulingBudget(
                 token_budget=self.scheduler_config.max_num_batched_tokens,

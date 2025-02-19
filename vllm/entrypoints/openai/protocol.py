@@ -1051,6 +1051,22 @@ class CompletionStreamResponse(OpenAIBaseModel):
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = Field(default=None)
 
+class RelCompletionStreamResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"cmpl-{random_uuid()}")
+    object: str = "text_completion"
+    created: int
+    model: str
+    choices: List[CompletionResponseStreamChoice]
+    usage: UsageInfo
+    # newly added
+    arrival_time: float
+    last_token_time: float
+    first_scheduled_time: float
+    first_token_time: float
+    time_in_queue: float
+    finished_time: float
+    scheduler_time: float
+    num_cached_tokens: int
 
 class EmbeddingResponseData(OpenAIBaseModel):
     index: int

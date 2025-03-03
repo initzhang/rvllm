@@ -1319,6 +1319,7 @@ class LLMEngine:
             >>>     if not (engine.has_unfinished_requests() or example_inputs):
             >>>         break
         """
+        rel_ts = time.perf_counter()
         if self.parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "Pipeline parallelism is only supported through AsyncLLMEngine "
@@ -1471,6 +1472,14 @@ class LLMEngine:
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
 
+        """
+        #MODIFIED here
+        """
+        if scheduler_outputs.num_prefill_groups == 0:
+            # decoding step
+            elapsed_time = time.perf_counter() - rel_ts
+            logger.info(f"kkk || num of decode tokens: {scheduler_outputs.running_queue_size}, time elapsed: {elapsed_time:.4f}")
+            # for prefill step, related stats are logged in vllm/core/scheduler.py
         return ctx.request_outputs
 
     def _has_remaining_steps(

@@ -149,6 +149,8 @@ class SchedulerOutputs:
     # The number of requests in the running queue
     running_queue_size: int
     preempted: int
+    # Add for profiling
+    num_uncached_prefill_tokens: int = -1
 
     def __post_init__(self):
         # Swap in and swap out should never happen at the same time.
@@ -1240,10 +1242,14 @@ class Scheduler:
 
     def update_query_priority(self):
         """
-        very simple logic: only update for the waiting queries
-        need to build a performance model to predict waiting cost
-        cost = f(input tokens, output tokens)
+        only update for the waiting queries
+        priority is calculated based on (1) prefill tokens cost (2) decode tokens cost
+        prefill cost need to consider cached content
         """
+        slope_prefill, intercept_prefill = [0.00013357, 0.02103064]
+        slope_decode, intercept_decode = [0.00019604, 0.02288562]
+
+        ts = time.perf_counter()
         waiting_queries = defaultdict(list)
         for sg in self.waiting:
             waiting_queries[sg.rel_id].append(sg)
@@ -1253,9 +1259,17 @@ class Scheduler:
             cost = 0
             for sg in sg_list:
                 # output tokens
-                cost += 1 * sg.sampling_params.max_tokens
+                cost += slope_decode * sg.sampling_params.max_tokens + intercept_decode
+
                 # input tokens
-                cost += 1 * sg.get_seqs()[0].get_prompt_len()
+                #cost += slope_prefill * sg.get_seqs()[0].get_prompt_len() + intercept_prefill
+
+                # uncached input tokens
+                num_uncached_new_tokens, num_cached_new_tokens = \
+                    self._pure_get_num_new_uncached_and_cached_tokens(
+                        sg, SequenceStatus.WAITING)
+                cost += slope_prefill * num_uncached_new_tokens + intercept_prefill
+
             for sg in sg_list:
                 sg.priority = cost
             record_relid_cost.append((rel_id, cost))
@@ -1265,6 +1279,9 @@ class Scheduler:
         for rel_id, _ in sorted(record_relid_cost, key=lambda x:x[1]):
             new_waiting += waiting_queries[rel_id]
         self.waiting = deque(new_waiting)
+        
+        elapsed_time = time.perf_counter() - ts
+        logger.info(f"priority updating overhead in seconds: {elapsed_time}")
      
     def _schedule_default(self) -> SchedulerOutputs:
         """Schedule queued requests.
@@ -1380,8 +1397,8 @@ class Scheduler:
             swapped_in = SchedulerSwappedInOutputs.create_empty()
 
             # prefill without preemption
-            #prefills = self._schedule_prefills(budget,
-            prefills = self._schedule_prefills_separated(budget,
+            #prefills = self._schedule_prefills_separated(budget,
+            prefills = self._schedule_prefills(budget,
                                                curr_loras,
                                                enable_chunking=False)
         else:
@@ -1535,6 +1552,7 @@ class Scheduler:
             num_lookahead_slots=running_scheduled.num_lookahead_slots,
             running_queue_size=len(self.running),
             preempted=preempted,
+            num_uncached_prefill_tokens=budget.num_batched_tokens,
         )
 
 
@@ -1567,8 +1585,8 @@ class Scheduler:
 
         # If any requests are swapped, prioritized swapped requests.
         if not self.swapped:
-            #prefills = self._schedule_prefills(budget,
-            prefills = self._schedule_prefills_separated(budget,
+            #prefills = self._schedule_prefills_separated(budget,
+            prefills = self._schedule_prefills(budget,
                                                curr_loras,
                                                enable_chunking=False)
 
@@ -2154,6 +2172,90 @@ class Scheduler:
                 return 0
 
         return self.scheduler_config.num_lookahead_slots
+
+    def _pure_get_num_new_uncached_and_cached_tokens(
+        self,
+        seq_group: SequenceGroup,
+        status: SequenceStatus,
+    ) -> Tuple[int, int]:
+        """
+        Returns the number of new uncached and cached tokens to schedule for a
+        given sequence group that's in a given `status`.
+
+        budget and chunking are not considered
+
+        Args:
+            seq_group: The sequence group to get the number of new tokens to
+                schedule.
+            status: The status of the sequences to get the number of new tokens
+                to schedule.
+
+        Returns:
+            A tuple of two ints. The first int is the number of new uncached
+            tokens to schedule. The second int is the number of cached tokens.
+        """
+        num_cached_new_tokens = 0
+        num_uncached_new_tokens = 0
+
+        seqs = seq_group.get_seqs(status=status)
+        # Compute the number of new uncached and cached tokens for
+        # each sequence.
+        for seq in seqs:
+            if not seq.is_prefill():
+                # Decode sequences should always just have 1 uncached token
+                # TODO(rickyx): Actually is this still correct for multi-step?
+                num_uncached_new_tokens += 1
+                continue
+
+            num_computed_tokens_seq = seq.get_num_computed_tokens()
+            all_num_new_tokens_seq = seq.get_len() - num_computed_tokens_seq
+            if not self.cache_config.enable_prefix_caching:
+                # If prefix caching is not enabled, all new tokens are uncached.
+                num_uncached_new_tokens += all_num_new_tokens_seq
+                continue
+
+            # NOTE: the cache token might be currently in a block that's in an
+            # evictor meaning that it's not yet allocated. However, we don't
+            # exclude such tokens in the cache count because it will be
+            # guaranteed to be allocated later if the sequence can be allocated.
+            num_cached_tokens_seq = self.block_manager.get_num_cached_tokens(
+                seq)
+
+            # Sanity check.
+            if num_cached_tokens_seq < num_computed_tokens_seq:
+                # This should only happen with chunked prefill, and
+                # the seq is still in prefill. The `num_cached_tokens_seq`
+                # is the value we calculated on scheduling the first prefill.
+                # For subsequent continuous prefill steps, we cached the
+                # number of cache tokens for the sequence so the cached token
+                # count could be less than the number of computed tokens.
+                # See comments on `ComputedBlocksTracker` for more details.
+                assert (
+                    seq.is_prefill() and seq.status == SequenceStatus.RUNNING
+                    and self.scheduler_config.chunked_prefill_enabled
+                ), ("Number of cached tokens should not be less than the "
+                    "number of computed tokens for a sequence that's still "
+                    f"in prefill. But there are {num_cached_tokens_seq} cached "
+                    f"tokens and {num_computed_tokens_seq} computed tokens "
+                    f"for sequence {seq.seq_id}.")
+
+            num_cached_new_tokens_seq = max(
+                0, num_cached_tokens_seq - num_computed_tokens_seq)
+            num_uncached_new_tokens_seq = (all_num_new_tokens_seq -
+                                           num_cached_new_tokens_seq)
+
+            num_uncached_new_tokens += num_uncached_new_tokens_seq
+            num_cached_new_tokens += num_cached_new_tokens_seq
+
+        if num_uncached_new_tokens == 0 and num_cached_new_tokens > 0:
+            # For a fully cached hit sequence, we actually need to recompute the
+            # last token. So we need at least 1 uncached token to schedule.
+            # See ModelRunner._compute_for_prefix_cache_hit for more details.
+            num_uncached_new_tokens = 1
+            num_cached_new_tokens -= 1
+
+        return num_uncached_new_tokens, num_cached_new_tokens
+
 
     def _get_num_new_uncached_and_cached_tokens(
         self,

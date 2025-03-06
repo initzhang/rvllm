@@ -1475,11 +1475,14 @@ class LLMEngine:
         """
         #MODIFIED here
         """
+        elapsed_time = time.perf_counter() - rel_ts
         if scheduler_outputs.num_prefill_groups == 0:
             # decoding step
-            elapsed_time = time.perf_counter() - rel_ts
             logger.info(f"kkk || num of decode tokens: {scheduler_outputs.running_queue_size}, time elapsed: {elapsed_time:.4f}")
-            # for prefill step, related stats are logged in vllm/core/scheduler.py
+        else:
+            # prefill step
+            logger.info(f"ccc || num of prefill tokens: {scheduler_outputs.num_uncached_prefill_tokens}, time elapsed: {elapsed_time:.4f}")
+
         return ctx.request_outputs
 
     def _has_remaining_steps(

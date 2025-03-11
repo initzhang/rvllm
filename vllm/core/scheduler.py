@@ -1240,15 +1240,11 @@ class Scheduler:
 
         return running_queries, waiting_queries
 
-    def update_query_priority(self):
+    def _update_query_priority_tc(self):
         """
         only update for the waiting queries
-        priority is calculated based on (1) prefill tokens cost (2) decode tokens cost
-        prefill cost need to consider cached content
+        priority as unfinished token count
         """
-        slope_prefill, intercept_prefill = [0.00013357, 0.02103064]
-        slope_decode, intercept_decode = [0.00019604, 0.02288562]
-
         ts = time.perf_counter()
         waiting_queries = defaultdict(list)
         for sg in self.waiting:
@@ -1259,22 +1255,14 @@ class Scheduler:
             cost = 0
             for sg in sg_list:
                 # output tokens
-                cost += slope_decode * sg.sampling_params.max_tokens + intercept_decode
-
+                cost += sg.sampling_params.max_tokens
                 # input tokens
-                #cost += slope_prefill * sg.get_seqs()[0].get_prompt_len() + intercept_prefill
-
-                # uncached input tokens
-                num_uncached_new_tokens, num_cached_new_tokens = \
-                    self._pure_get_num_new_uncached_and_cached_tokens(
-                        sg, SequenceStatus.WAITING)
-                cost += slope_prefill * num_uncached_new_tokens + intercept_prefill
-
+                cost += sg.get_seqs()[0].get_prompt_len()
             for sg in sg_list:
+                # update priority
                 sg.priority = cost
             record_relid_cost.append((rel_id, cost))
 
-        #self.waiting = deque(sorted(self.waiting, key=self._get_priority))
         new_waiting = []
         for rel_id, _ in sorted(record_relid_cost, key=lambda x:x[1]):
             new_waiting += waiting_queries[rel_id]
@@ -1283,6 +1271,168 @@ class Scheduler:
         elapsed_time = time.perf_counter() - ts
         logger.info(f"priority updating overhead in seconds: {elapsed_time}")
      
+    def _update_query_priority_cm(self, info_prefill, info_decode):
+        """
+        only update for the waiting queries
+        priority is calculated based on (1) prefill tokens cost (2) decode tokens cost
+        prefill cost need to consider cached content
+
+        slope_prefill, intercept_prefill = [0.00013357, 0.02103064]
+        slope_decode, intercept_decode = [0.00019604, 0.02288562]
+        """
+        ts = time.perf_counter()
+        slope_prefill, intercept_prefill = info_prefill
+        slope_decode, intercept_decode = info_decode
+
+        waiting_queries = defaultdict(list)
+        for sg in self.waiting:
+            waiting_queries[sg.rel_id].append(sg)
+
+        record_relid_cost = []
+        for rel_id, sg_list in waiting_queries.items():
+            cost = 0
+            for sg in sg_list:
+                # output tokens
+                cost += slope_decode * sg.sampling_params.max_tokens + intercept_decode
+                # uncached input tokens
+                num_uncached_new_tokens, num_cached_new_tokens = \
+                    self._pure_get_num_new_uncached_and_cached_tokens(
+                        sg, SequenceStatus.WAITING)
+                cost += slope_prefill * num_uncached_new_tokens + intercept_prefill
+            for sg in sg_list:
+                # update priority
+                sg.priority = cost
+            record_relid_cost.append((rel_id, cost))
+
+        new_waiting = []
+        for rel_id, _ in sorted(record_relid_cost, key=lambda x:x[1]):
+            new_waiting += waiting_queries[rel_id]
+        self.waiting = deque(new_waiting)
+        
+        elapsed_time = time.perf_counter() - ts
+        logger.info(f"priority updating overhead in seconds: {elapsed_time}")
+
+    def _update_query_priority_bs(self, info_prefill, info_decode, max_sim_steps=0):
+        """
+        only update for the waiting queries
+        priority is calculated based on (1) prefill tokens cost (2) decode tokens cost
+        prefill cost need to consider cached content
+
+        args:
+            * info_prefill: (slope, intercept) for prefill tokens
+            * info_decode: (slope, intercept) for decode tokens
+            * max_sim_steps: assume cache hit ratio will stablize after max_sim_steps
+
+
+        additionally consider batch simulation
+
+        (1) first obtain initial uncached ratio with self._pure_get_num_new_uncached_and_cached_tokens
+        (2) use self.scheduler_config.max_model_len to derive approx #reqs per batch
+        (3) obtain the cost of the batch ONE
+        (4) assume that all batch ONE contents are cached, estimate the uncached ratio of batch TWO
+        (5) obtain the cost of batch TWO
+        (6) repeat 4,5 until finish
+
+        another approx: every update only call _pure_get for the first batch
+        obtain an average cache hit **ratio**, and a **set** of tokens appearing in the first batch
+        """
+
+        ts = time.perf_counter()
+        slope_prefill, intercept_prefill = info_prefill
+        slope_decode, intercept_decode = info_decode
+
+        waiting_queries = defaultdict(list)
+        for sg in self.waiting:
+            waiting_queries[sg.rel_id].append(sg)
+
+        record_relid_cost = []
+        for rel_id, sg_list in waiting_queries.items():
+            total_cost = 0
+
+            # obtain first batch's cost and statistics
+            first_batch_uncached_tokens = 0
+            first_batch_cached_tokens = 0
+            first_batch_num_seqs = 0
+            first_batch_max_output_len = 0
+            for sg in sg_list:
+                num_uncached_new_tokens, num_cached_new_tokens = \
+                    self._pure_get_num_new_uncached_and_cached_tokens(
+                        sg, SequenceStatus.WAITING)
+                if first_batch_uncached_tokens + num_uncached_new_tokens < self.scheduler_config.max_model_len:
+                    # okay to add
+                    first_batch_uncached_tokens += num_uncached_new_tokens
+                    first_batch_cached_tokens += num_cached_new_tokens
+                    first_batch_num_seqs += 1
+                    first_batch_max_output_len = max(first_batch_max_output_len, sg.sampling_params.max_tokens)
+                else:
+                    break
+
+            # first batch content determined, calculate cost
+            total_cost += first_batch_uncached_tokens * slope_prefill + intercept_prefill
+            total_cost += first_batch_max_output_len * (first_batch_num_seqs * slope_decode
+                    + intercept_decode)
+
+            # check for remaining requests
+            if len(sg_list) > first_batch_num_seqs:
+                first_batch_cache_miss_ratio = first_batch_uncached_tokens / (
+                        first_batch_uncached_tokens + first_batch_cached_tokens)
+                
+                # estimate subsequent cache miss ratio
+                if max_sim_steps == 0:
+                    subsequent_cache_miss_ratio = first_batch_cache_miss_ratio
+                else:
+                    assert max_sim_steps == 1, "Not Implemented when max_sim_steps >= 2"
+                    first_batch_token_ids_set = self._obtain_token_ids_set_from_sg_list(sg_list[:first_batch_num_seqs])
+                    next_batch_token_ids_set = self._obtain_token_ids_set_from_sg_list(sg_list[first_batch_num_seqs:first_batch_num_seqs*2])
+                    overlap_token_ids = next_batch_token_ids_set.intersection(first_batch_token_ids_set)
+                    overlap_ratio = len(overlap_token_ids) / len(next_batch_token_ids_set)
+                    subsequent_cache_miss_ratio = max(overlap_ratio, first_batch_cache_miss_ratio)
+
+                # replace _pure_get_num_new_uncached_and_cached_tokens with cache_miss_ratio
+                # as approximation for remaining requests
+                next_batch_num_seqs = 0
+                next_batch_uncached_tokens = 0
+                next_batch_max_output_len = 0
+                for sg in sg_list[first_batch_num_seqs:]:
+                    estimated_num_new_tokens = subsequent_cache_miss_ratio * sg.get_seqs()[0].get_prompt_len()
+                    if estimated_num_new_tokens + next_batch_uncached_tokens > self.scheduler_config.max_model_len:
+                        # existing batch filled, calculate cost
+                        total_cost += next_batch_uncached_tokens * slope_prefill + intercept_prefill
+                        total_cost += next_batch_max_output_len * (next_batch_num_seqs * slope_decode
+                                + intercept_decode)
+                        # clear for new batch
+                        next_batch_num_seqs = 0
+                        next_batch_uncached_tokens = 0
+                        next_batch_max_output_len = 0
+                    # add request to batch
+                    next_batch_num_seqs += 1
+                    next_batch_uncached_tokens += estimated_num_new_tokens
+                    next_batch_max_output_len = max(sg.sampling_params.max_tokens, next_batch_max_output_len)
+                # deal with leftover ones
+                if next_batch_num_seqs != 0:
+                    total_cost += next_batch_uncached_tokens * slope_prefill + intercept_prefill
+                    total_cost += next_batch_max_output_len * (next_batch_num_seqs * slope_decode
+                            + intercept_decode)
+
+            # update priority
+            for sg in sg_list:
+                sg.priority = total_cost
+            record_relid_cost.append((rel_id, total_cost))
+
+        new_waiting = []
+        for rel_id, _ in sorted(record_relid_cost, key=lambda x:x[1]):
+            new_waiting += waiting_queries[rel_id]
+        self.waiting = deque(new_waiting)
+        
+        elapsed_time = time.perf_counter() - ts
+        logger.info(f"priority updating overhead in seconds: {elapsed_time}")
+     
+    def _obtain_token_ids_set_from_sg_list(self, sg_list):
+        all_prompt_tokens_set = set()
+        for sg in sg_list:
+            all_prompt_tokens_set.update(sg.get_seqs()[0].prompt_token_ids)
+        return all_prompt_tokens_set
+
     def _schedule_default(self) -> SchedulerOutputs:
         """Schedule queued requests.
         
@@ -1297,65 +1447,36 @@ class Scheduler:
             return self._schedule_default_old()
 
         logger.info("%"*30+"xzhanggb"+"%"*30)
-        assert self.scheduler_config.policy in ['priority_full_preempt', 'priority_no_preempt', 'priority_ada_preempt']
+        assert self.scheduler_config.policy in ['priority_bs', 'priority_tc', 'priority_cm']
         assert not self.lora_enabled
         assert not self.swapped
         curr_loras = None
 
-        if self.scheduler_config.policy == "priority_ada_preempt":
+        if self.scheduler_config.policy == "priority_cm":
             """
-            for the running queue, we do not modify it at all
-            but we will check the waiting requests belonging to the same running query
-            if remaining requests are little, we will put them ahead of other 
-            queries with higher priority in the waiting queue
-
-            process:
-            * agg running and waiting requests based on query 
-            * for each running query, check their remaining workload in waiting queue
-            * if remaining tokens / total tokens < threshold, prioritize remaining requests
-            * the rest of waiting queries are sorted based on their original priority
-            
-            deprecated for now
+            dynamically update the priority w.r.t. a cost model
+            cost = prefill_cost + decode_cost
+            prefill_cost = f(number of uncached prompt tokens)
+            decode_cost = f(number of decoding tokens)
             """
-            raise NotImplementedError
-            running_queries, waiting_queries = self.agg_query_dict()
-            supercede_queries = []
-
-            for q_prio in running_queries.keys():
-                if q_prio not in waiting_queries.keys():
-                    break
-                total_tokens = q_prio
-                waiting_tokens = 0
-                running_tokens = 0
-                for sg in waiting_queries[q_prio]:
-                    waiting_tokens += sg.sampling_params.max_tokens
-                    waiting_tokens += sg.get_seqs()[0].get_prompt_len()
-                for sg in running_queries[q_prio]:
-                    running_tokens += sg.sampling_params.max_tokens
-                    running_tokens += sg.get_seqs()[0].get_prompt_len()
-                if waiting_tokens / q_prio > 0.1 or running_tokens / q_prio > 0.1:
-                    # too much leftover work, should preempt
-                    continue
-                # run the current query to end first
-                logger.info(f"supercede query: {q_prio}, running/total {running_tokens/q_prio:.2f}, waiting/total {waiting_tokens/q_prio:.2f}")
-                supercede_queries.append(q_prio)
-
-            if len(supercede_queries) == 0:
-                # simply sort 
-                self.waiting = deque(sorted(self.waiting, key=self._get_priority))
-            else:
-                # order waiting requests
-                front_waiting = [sg for sg in self.waiting if sg.priority in supercede_queries]
-                back_waiting = [sg for sg in self.waiting if sg.priority not in supercede_queries]
-                front_waiting = sorted(front_waiting, key=self._get_priority)
-                back_waiting = sorted(back_waiting, key=self._get_priority)
-                self.waiting = deque(front_waiting + back_waiting)
-
             # Include running requests to the budget.
             budget = SchedulingBudget(
                 token_budget=self.scheduler_config.max_num_batched_tokens,
                 max_num_seqs=self.scheduler_config.max_num_seqs,
             )
+
+            # update waiting requests' priority
+            if self.scheduler_config.max_model_len == 8192:
+                # llama3-8b
+                info_prefill = (0.00013357, 0.02103064) 
+                info_decode = (0.00019604, 0.02288562)
+            else:
+                assert self.scheduler_config.max_model_len == 4096
+                # llama2-7b
+                info_prefill = (0.00014387, 0.01505025) 
+                info_decode = (0.00033761, 0.01722416)
+                
+            self._update_query_priority_cm(info_prefill, info_decode)
 
             # Make sure we include num running seqs before scheduling prefill,
             # so that we don't schedule beyond max_num_seqs for prefill.
@@ -1368,14 +1489,15 @@ class Scheduler:
             swapped_in = SchedulerSwappedInOutputs.create_empty()
 
             # prefill without preemption
+            #prefills = self._schedule_prefills_separated(budget,
             prefills = self._schedule_prefills(budget,
                                                curr_loras,
                                                enable_chunking=False)
 
-        elif self.scheduler_config.policy == "priority_no_preempt" :
+        elif self.scheduler_config.policy == "priority_tc" :
             """
-            for the running query, we do not preempt them
-            and we will always sort waiting queries based on the priority
+            dynamically update the priority as tokens count
+            sum of prompt tokens and max_decode_tokens for requests in waiting queue
             """
             # Include running requests to the budget.
             budget = SchedulingBudget(
@@ -1384,7 +1506,7 @@ class Scheduler:
             )
 
             # update waiting requests' priority
-            self.update_query_priority()
+            self._update_query_priority_tc()
 
             # Make sure we include num running seqs before scheduling prefill,
             # so that we don't schedule beyond max_num_seqs for prefill.
@@ -1402,25 +1524,32 @@ class Scheduler:
                                                curr_loras,
                                                enable_chunking=False)
         else:
+            # priority_bs
             """
-            priority_full_preempt
-            we will actively reorganize all running and waiting queries
-            to make sure the running ones have highest priority
+            how to incorporate batch simulation?
+            (1) the simulation is only necessary when no reqs have been processed, or history_cache_hit=0
+            (2) maintain an relID -> history cache hit data structure
 
-            deprecated for now
+            problem: historical cache hit cannot be obtained? no
             """
-            raise NotImplementedError
             # Include running requests to the budget.
             budget = SchedulingBudget(
                 token_budget=self.scheduler_config.max_num_batched_tokens,
                 max_num_seqs=self.scheduler_config.max_num_seqs,
             )
 
-            # sort two queues based on priority
-            self.running = deque(sorted(self.running, key=self._get_priority))
-            self.waiting = deque(sorted(self.waiting, key=self._get_priority))
-
-            old_running_queries, old_waiting_queries = self.agg_query_dict()
+            # update waiting requests' priority
+            if self.scheduler_config.max_model_len == 8192:
+                # llama3-8b
+                info_prefill = (0.00013357, 0.02103064) 
+                info_decode = (0.00019604, 0.02288562)
+            else:
+                assert self.scheduler_config.max_model_len == 4096
+                # llama2-7b
+                info_prefill = (0.00014387, 0.01505025) 
+                info_decode = (0.00033761, 0.01722416)
+                
+            self._update_query_priority_bs(info_prefill, info_decode, 1)
 
             # Make sure we include num running seqs before scheduling prefill,
             # so that we don't schedule beyond max_num_seqs for prefill.
@@ -1432,50 +1561,11 @@ class Scheduler:
             running_scheduled = SchedulerRunningOutputs.create_empty()
             swapped_in = SchedulerSwappedInOutputs.create_empty()
 
-            # first try prefill without preemption
-            initial_prefills = self._schedule_prefills(budget,
+            # prefill without preemption
+            prefills = self._schedule_prefills(budget,
                                                curr_loras,
                                                enable_chunking=False)
 
-            # then check whether still need to preempt
-            later_prefills = []
-            accum_preempt = 0
-            while self.running and self.waiting and self._get_priority(self.running[-1]) > self._get_priority(self.waiting[0]):
-                cur_preempt = self._schedule_priority_preemption(budget)
-                accum_preempt += cur_preempt
-                logger.info(f"iterative preempt {cur_preempt}")
-                # the _schedule_prefills does not add self.running, but only change budget and self.waiting
-                cur_prefills = self._schedule_prefills(budget, 
-                                                   curr_loras, 
-                                                   enable_chunking=False)
-                later_prefills.append(cur_prefills)
-            prefills = self._combine_prefills([initial_prefills]+later_prefills)
-            logger.info(f"total preemption: {accum_preempt}")
-
-            # print preempt statistics
-            if accum_preempt > 0:
-                new_running_queries, new_waiting_queries = self.agg_query_dict()
-                evicted_queries_prio = set(old_running_queries.keys()) - set(new_running_queries.keys())
-                logger.info(f"$$$$ evict {len(evicted_queries_prio)} relational query")
-                for pe in evicted_queries_prio:
-                    """
-                    sg.sampling_params.max_tokens
-                    sg[0].get_prompt_len()
-                    sg[0].get_output_len()
-                    """
-                    orig_total_tokens = pe
-                    preempt_tokens = 0
-                    waiting_tokens = 0
-                    for sg in new_waiting_queries[pe]:
-                        preempt_tokens += sg.get_seqs()[0].get_prompt_len()
-                        preempt_tokens += sg.sampling_params.max_tokens
-
-                    for sg in old_waiting_queries[pe]:
-                        waiting_tokens += sg.get_seqs()[0].get_prompt_len()
-                        waiting_tokens += sg.sampling_params.max_tokens
-                    logger.info(f"$$$$ query: {orig_total_tokens}, preempt {preempt_tokens}, waiting {waiting_tokens}")
-                    logger.info(f"$$$$ preempt/total {preempt_tokens/orig_total_tokens:.2f}, waiting/total {waiting_tokens/orig_total_tokens:.2f}")
-        
 
         ##################################
         # logic below is not modified

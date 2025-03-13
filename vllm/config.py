@@ -1405,6 +1405,10 @@ class SchedulerConfig:
 
     chunked_prefill_enabled: bool = field(init=False)
 
+    # slope and intercept of execution time w.r.t. #tokens
+    info_prefill: tuple = ()
+    info_decode: tuple = ()
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

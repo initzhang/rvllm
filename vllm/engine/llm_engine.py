@@ -1374,6 +1374,7 @@ class LLMEngine:
         assert scheduler_outputs is not None
 
         if not scheduler_outputs.is_empty():
+            logger.info(">> compute engine step")
 
             # Check if we have a cached last_output from the previous iteration.
             # For supporting PP this is probably the best way to pass the
@@ -1406,6 +1407,7 @@ class LLMEngine:
             if self.scheduler_config.is_multi_step:
                 self._update_cached_scheduler_output(virtual_engine, outputs)
         else:
+            logger.info(">> idle engine step")
             # Nothing scheduled => If there is pending async postprocessor,
             # then finish it here.
             if len(ctx.output_queue) > 0:
@@ -1472,9 +1474,6 @@ class LLMEngine:
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
 
-        """
-        #MODIFIED here
-        """
         elapsed_time = time.perf_counter() - rel_ts
         if scheduler_outputs.num_prefill_groups == 0:
             # decoding step

@@ -1271,7 +1271,7 @@ class Scheduler:
         elapsed_time = time.perf_counter() - ts
         logger.info(f"priority updating overhead in seconds: {elapsed_time}")
      
-    def _update_query_priority_cm(self, info_prefill, info_decode):
+    def _update_query_priority_cm(self):
         """
         only update for the waiting queries
         priority is calculated based on (1) prefill tokens cost (2) decode tokens cost
@@ -1281,8 +1281,8 @@ class Scheduler:
         slope_decode, intercept_decode = [0.00019604, 0.02288562]
         """
         ts = time.perf_counter()
-        slope_prefill, intercept_prefill = info_prefill
-        slope_decode, intercept_decode = info_decode
+        slope_prefill, intercept_prefill = self.scheduler_config.info_prefill
+        slope_decode, intercept_decode = self.scheduler_config.info_decode
 
         waiting_queries = defaultdict(list)
         for sg in self.waiting:
@@ -1312,15 +1312,13 @@ class Scheduler:
         elapsed_time = time.perf_counter() - ts
         logger.info(f"priority updating overhead in seconds: {elapsed_time}")
 
-    def _update_query_priority_bs(self, info_prefill, info_decode, max_sim_steps=0):
+    def _update_query_priority_bs(self, max_sim_steps=0):
         """
         only update for the waiting queries
         priority is calculated based on (1) prefill tokens cost (2) decode tokens cost
         prefill cost need to consider cached content
 
         args:
-            * info_prefill: (slope, intercept) for prefill tokens
-            * info_decode: (slope, intercept) for decode tokens
             * max_sim_steps: assume cache hit ratio will stablize after max_sim_steps
 
 
@@ -1338,8 +1336,8 @@ class Scheduler:
         """
 
         ts = time.perf_counter()
-        slope_prefill, intercept_prefill = info_prefill
-        slope_decode, intercept_decode = info_decode
+        slope_prefill, intercept_prefill = self.scheduler_config.info_prefill
+        slope_decode, intercept_decode = self.scheduler_config.info_decode
 
         waiting_queries = defaultdict(list)
         for sg in self.waiting:
@@ -1465,18 +1463,9 @@ class Scheduler:
                 max_num_seqs=self.scheduler_config.max_num_seqs,
             )
 
-            # update waiting requests' priority
-            if self.scheduler_config.max_model_len == 8192:
-                # llama3-8b
-                info_prefill = (0.00013357, 0.02103064) 
-                info_decode = (0.00019604, 0.02288562)
-            else:
-                assert self.scheduler_config.max_model_len == 4096
-                # llama2-7b
-                info_prefill = (0.00014387, 0.01505025) 
-                info_decode = (0.00033761, 0.01722416)
-                
-            self._update_query_priority_cm(info_prefill, info_decode)
+            assert len(self.scheduler_config.info_prefill) == 2
+            assert len(self.scheduler_config.info_decode) == 2
+            self._update_query_priority_cm()
 
             # Make sure we include num running seqs before scheduling prefill,
             # so that we don't schedule beyond max_num_seqs for prefill.
@@ -1523,7 +1512,7 @@ class Scheduler:
             prefills = self._schedule_prefills(budget,
                                                curr_loras,
                                                enable_chunking=False)
-        else:
+        elif self.scheduler_config.policy == "priority_bs":
             # priority_bs
             """
             how to incorporate batch simulation?
@@ -1539,17 +1528,9 @@ class Scheduler:
             )
 
             # update waiting requests' priority
-            if self.scheduler_config.max_model_len == 8192:
-                # llama3-8b
-                info_prefill = (0.00013357, 0.02103064) 
-                info_decode = (0.00019604, 0.02288562)
-            else:
-                assert self.scheduler_config.max_model_len == 4096
-                # llama2-7b
-                info_prefill = (0.00014387, 0.01505025) 
-                info_decode = (0.00033761, 0.01722416)
-                
-            self._update_query_priority_bs(info_prefill, info_decode, 1)
+            assert len(self.scheduler_config.info_prefill) == 2
+            assert len(self.scheduler_config.info_decode) == 2
+            self._update_query_priority_bs(1)
 
             # Make sure we include num running seqs before scheduling prefill,
             # so that we don't schedule beyond max_num_seqs for prefill.
@@ -1565,7 +1546,10 @@ class Scheduler:
             prefills = self._schedule_prefills(budget,
                                                curr_loras,
                                                enable_chunking=False)
-
+        else:
+            # approximate batch simulation with historical cache data reuse
+            assert self.scheduler_config.policy == "priority_abs"
+            raise NotImplementedError
 
         ##################################
         # logic below is not modified
@@ -2156,7 +2140,7 @@ class Scheduler:
         else:
             preemption_mode = PreemptionMode.RECOMPUTE
 
-        if self.num_cumulative_preemption % 50 == 0:
+        if self.num_cumulative_preemption % 10 == 0:
             logger.warning(
                 "Sequence group %s is preempted by %s mode because there is "
                 "not enough KV cache space. This can affect the end-to-end "

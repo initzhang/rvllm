@@ -199,6 +199,9 @@ class EngineArgs:
 
     generation_config: Optional[str] = None
 
+    info_prefill: Tuple[int, int] = ()
+    info_decode: Tuple[int, int] = ()
+
     def __post_init__(self):
         if not self.tokenizer:
             self.tokenizer = self.model
@@ -958,6 +961,20 @@ class EngineArgs:
             "loaded from model. If set to a folder path, the generation config "
             "will be loaded from the specified folder path.")
 
+        parser.add_argument(
+            '--info-prefill', 
+            nargs='+', 
+            type=float,
+            default=[],
+            help="slope and intercept of prefill engine step execution time w.r.t. #tokens")
+
+        parser.add_argument(
+            '--info-decode', 
+            nargs='+', 
+            type=float,
+            default=[],
+            help="slope and intercept of decode engine step execution time w.r.t. #tokens")
+
         return parser
 
     @classmethod
@@ -1178,6 +1195,14 @@ class EngineArgs:
                 "SelfAttnBlockSpaceManager (i.e. block manager v2),"
                 " please file an issue with detailed information.")
 
+        # cost model-based scheduling requires additional information
+        if self.scheduling_policy in ["priority_bs", "priority_abs"]:
+            if len(self.info_prefill) != 2 or len(self.info_decode) != 2:
+                raise ValueError(
+                    f"Invalid info_prefill & info_decode: {self.info_prefill}, {self.info_decode}.")
+            else:
+                logger.info(f"!!!! info for prefill and decode: {self.info_prefill}, {self.info_decode}")
+
         scheduler_config = SchedulerConfig(
             runner_type=model_config.runner_type,
             max_num_batched_tokens=self.max_num_batched_tokens,
@@ -1192,7 +1217,9 @@ class EngineArgs:
             multi_step_stream_outputs=self.multi_step_stream_outputs,
             send_delta_data=(envs.VLLM_USE_RAY_SPMD_WORKER
                              and parallel_config.use_ray),
-            policy=self.scheduling_policy)
+            policy=self.scheduling_policy,
+            info_prefill=tuple(self.info_prefill),
+            info_decode=tuple(self.info_decode))
         lora_config = LoRAConfig(
             bias_enabled=self.enable_lora_bias,
             max_lora_rank=self.max_lora_rank,

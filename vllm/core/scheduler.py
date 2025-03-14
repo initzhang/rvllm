@@ -421,6 +421,9 @@ class Scheduler:
         # for processing and deallocation by the free_finished_seq_groups()
         self._async_stopped: List[SequenceGroup] = []
 
+        self.historical_cache_miss = dict()
+        self.historical_staleness = dict()
+
     @property
     def next_cache_id(self):
         return (self.cache_id + 1) % self.num_cache_iters
@@ -1270,15 +1273,57 @@ class Scheduler:
         
         elapsed_time = time.perf_counter() - ts
         logger.info(f"priority updating overhead in seconds: {elapsed_time}")
-     
-    def _update_query_priority_cm(self):
-        """
-        only update for the waiting queries
-        priority is calculated based on (1) prefill tokens cost (2) decode tokens cost
-        prefill cost need to consider cached content
 
-        slope_prefill, intercept_prefill = [0.00013357, 0.02103064]
-        slope_decode, intercept_decode = [0.00019604, 0.02288562]
+
+    def _compute_cache_miss(self, sg_list):
+        """
+        given a sg_list, calculate the cache miss rate
+        key problem: the first batch and subsequent batches may have very different ratios
+        therefore, return two floats (cache_miss_first, cache_miss_subsequent)
+        """
+        sample_size = min(10, len(sg_list))
+
+        first_batch_uncached_tokens = 0
+        first_batch_cached_tokens = 0
+        for sg in sg_list[:sample_size]:
+            num_uncached_new_tokens, num_cached_new_tokens = \
+                self._pure_get_num_new_uncached_and_cached_tokens(
+                    sg, SequenceStatus.WAITING)
+            first_batch_uncached_tokens += num_uncached_new_tokens
+            first_batch_cached_tokens += num_cached_new_tokens
+
+        first_batch_cache_miss_ratio = first_batch_uncached_tokens / (
+                first_batch_uncached_tokens + first_batch_cached_tokens)
+
+        if first_batch_uncached_tokens < self.scheduler_config.max_model_len:
+            # one batch is sufficient to prefill all
+            return (first_batch_cache_miss_ratio, first_batch_cache_miss_ratio)
+
+        if sample_size < 10:
+            sample_size = int(sample_size / 2)
+            assert sample_size
+
+        # calculate subsequent_batch_cache_miss_ratio
+        sampled_first_batch_token_ids_set = self._obtain_token_ids_set_from_sg_list(sg_list[:sample_size])
+        sampled_next_batch_token_ids_set = self._obtain_token_ids_set_from_sg_list(sg_list[sample_size:sample_size*2])
+        overlap_token_ids = sampled_next_batch_token_ids_set.intersection(sampled_first_batch_token_ids_set)
+        overlap_ratio = len(overlap_token_ids) / len(sampled_next_batch_token_ids_set)
+        subsequent_batch_cache_miss_ratio = max(overlap_ratio, first_batch_cache_miss_ratio)
+        return (first_batch_cache_miss_ratio, subsequent_batch_cache_miss_ratio)
+
+     
+    def _update_query_priority_abs(self, staleness_bound=-1):
+        """
+        args:
+            * staleness_bound: reuse historical data for at most given times, then requires update
+            * -1 means always recompute cache miss ratio without reuse
+
+        process:
+            approximately update with batch simulation
+            (1) abstract api: obtain cache miss rate
+                (a). if no historical data is available/staleness_bound exceeded, compute cache miss
+                (b). if found historical data, reuse at most staleness_bound times
+            (2) with the cache miss rate, directly derive #batches, and the cost
         """
         ts = time.perf_counter()
         slope_prefill, intercept_prefill = self.scheduler_config.info_prefill
@@ -1290,15 +1335,48 @@ class Scheduler:
 
         record_relid_cost = []
         for rel_id, sg_list in waiting_queries.items():
+            
+            if rel_id in self.historical_cache_miss and self.historical_staleness[rel_id] <= staleness_bound:
+                # reuse historical cache miss ratio
+                first_cache_miss_ratio, subsequent_cache_miss_ratio = self.historical_cache_miss[rel_id]
+                self.historical_staleness[rel_id] += 1
+            else:
+                # either first time, or exceed staleness bound, recompute cache miss 
+                first_cache_miss_ratio, subsequent_cache_miss_ratio = self._compute_cache_miss(sg_list)
+                self.historical_cache_miss[rel_id] = (first_cache_miss_ratio, subsequent_cache_miss_ratio)
+                self.historical_staleness[rel_id] = 0
+
             cost = 0
+            cur_batch_prefill_tokens = 0
+            cur_batch_num_seqs = 0
+            cur_batch_max_output_len = 0
             for sg in sg_list:
-                # output tokens
-                cost += slope_decode * sg.sampling_params.max_tokens + intercept_decode
-                # uncached input tokens
-                num_uncached_new_tokens, num_cached_new_tokens = \
-                    self._pure_get_num_new_uncached_and_cached_tokens(
-                        sg, SequenceStatus.WAITING)
-                cost += slope_prefill * num_uncached_new_tokens + intercept_prefill
+                if cost == 0:
+                    # first batch
+                    uncache_tokens = sg.get_seqs()[0].get_prompt_len() * first_cache_miss_ratio
+                else:
+                    # subsequent batch
+                    uncache_tokens = sg.get_seqs()[0].get_prompt_len() * subsequent_cache_miss_ratio
+
+                if cur_batch_prefill_tokens + uncache_tokens > self.scheduler_config.max_model_len:
+                    # prefill cost
+                    cost += cur_batch_prefill_tokens * slope_prefill + intercept_prefill
+                    # decode cost
+                    cost += (cur_batch_num_seqs * slope_decode + intercept_decode) * cur_batch_max_output_len
+                    # reset 
+                    cur_batch_prefill_tokens = 0
+                    cur_batch_num_seqs = 0
+                    cur_batch_max_output_len = 0
+                # batching
+                cur_batch_prefill_tokens += uncache_tokens
+                cur_batch_num_seqs += 1
+                cur_batch_max_output_len = max(cur_batch_max_output_len, sg.sampling_params.max_tokens)
+
+            # leftover
+            if cur_batch_num_seqs:
+                cost += cur_batch_prefill_tokens * slope_prefill + intercept_prefill
+                cost += (cur_batch_num_seqs * slope_decode + intercept_decode ) * cur_batch_max_output_len
+
             for sg in sg_list:
                 # update priority
                 sg.priority = cost
@@ -1445,18 +1523,12 @@ class Scheduler:
             return self._schedule_default_old()
 
         logger.info("%"*30+"xzhanggb"+"%"*30)
-        assert self.scheduler_config.policy in ['priority_bs', 'priority_tc', 'priority_cm']
+        assert self.scheduler_config.policy in ['priority_bs', 'priority_tc', 'priority_abs']
         assert not self.lora_enabled
         assert not self.swapped
         curr_loras = None
 
-        if self.scheduler_config.policy == "priority_cm":
-            """
-            dynamically update the priority w.r.t. a cost model
-            cost = prefill_cost + decode_cost
-            prefill_cost = f(number of uncached prompt tokens)
-            decode_cost = f(number of decoding tokens)
-            """
+        if self.scheduler_config.policy == "priority_abs":
             # Include running requests to the budget.
             budget = SchedulingBudget(
                 token_budget=self.scheduler_config.max_num_batched_tokens,
@@ -1465,7 +1537,7 @@ class Scheduler:
 
             assert len(self.scheduler_config.info_prefill) == 2
             assert len(self.scheduler_config.info_decode) == 2
-            self._update_query_priority_cm()
+            self._update_query_priority_abs()
 
             # Make sure we include num running seqs before scheduling prefill,
             # so that we don't schedule beyond max_num_seqs for prefill.
@@ -1547,9 +1619,7 @@ class Scheduler:
                                                curr_loras,
                                                enable_chunking=False)
         else:
-            # approximate batch simulation with historical cache data reuse
-            assert self.scheduler_config.policy == "priority_abs"
-            raise NotImplementedError
+            raise ValueError
 
         ##################################
         # logic below is not modified

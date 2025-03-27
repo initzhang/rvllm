@@ -2233,6 +2233,7 @@ class Scheduler:
             num_lookahead_slots=running_scheduled.num_lookahead_slots,
             running_queue_size=len(self.running),
             preempted=preempted,
+            num_uncached_prefill_tokens=budget.num_batched_tokens,
         )
 
     def _schedule_chunked_prefill(self) -> SchedulerOutputs:

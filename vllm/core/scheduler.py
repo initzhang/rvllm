@@ -1634,11 +1634,12 @@ class Scheduler:
         first_batch_cache_miss_ratio = first_batch_uncached_tokens / (
                 first_batch_uncached_tokens + first_batch_cached_tokens)
 
-        if first_batch_uncached_tokens < self.scheduler_config.max_model_len:
+        if first_batch_uncached_tokens <= self.scheduler_config.max_model_len:
             # one batch is sufficient to prefill all
             return (first_batch_cache_miss_ratio, first_batch_cache_miss_ratio)
 
-        if sample_size < 10:
+        if sample_size > len(sg_list) / 2:
+            # to avoid next_batch has no content...
             sample_size = int(sample_size / 2)
             assert sample_size
 

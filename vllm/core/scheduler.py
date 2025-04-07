@@ -1072,8 +1072,9 @@ class Scheduler:
     ) -> SchedulerPrefillOutputs:
         """Schedule sequence groups that are in prefill stage.
 
-        we prevent the prefill of next relQuery until the decode of
-        current query are finished
+        (1) if we prevent the prefill of next relQuery until the decode of
+            current query are finished, experiment results are bad
+        (2) trying to prevent only if current output len is small!
 
         we avoid preemption amsp by considering running requests' max 
         unfinished tokens, and proactively stop prefill
@@ -1081,8 +1082,10 @@ class Scheduler:
 
         # obtain current relQuery id
         running_rel_id = None
+        running_output_len = 0
         if self.running:
             running_rel_id = self.running[0].rel_id
+            running_output_len = self.running[0].sampling_params.max_tokens# - self.running[0].get_seqs()[0].get_output_len()
 
         # obtain number of blocks to reserve for necessary future tokens 
         NFT = 0
@@ -1102,8 +1105,9 @@ class Scheduler:
         while self._passed_delay(time.time()) and waiting_queue:
             seq_group = waiting_queue[0]
 
-            # before scheduling, check whether have other relQuery is decoding
-            if running_rel_id is not None and seq_group.rel_id != running_rel_id:
+            # before scheduling, check whether have other relQuery is decoding & decoding length is short
+            if running_rel_id is not None and seq_group.rel_id != running_rel_id and running_output_len <= 10:
+                logger.info(f"prevent prefill, running_rel_id: {running_rel_id}, running_output_len: {running_output_len}")
                 break
 
             waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)

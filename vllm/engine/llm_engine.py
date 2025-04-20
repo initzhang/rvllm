@@ -231,6 +231,8 @@ class LLMEngine:
         self.observability_config = vllm_config.observability_config or ObservabilityConfig(  # noqa
         )
 
+        self.seen_rel_ids = set()
+
         logger.info(
             "Initializing an LLM engine (v%s) with config: %s, "
             "use_cached_outputs=%s, ",
@@ -780,6 +782,10 @@ class LLMEngine:
 
         if arrival_time is None:
             arrival_time = time.time()
+
+        if rel_id not in self.seen_rel_ids:
+            logger.info(f"aaa || relQuery {rel_id} arrived at {arrival_time} or {time.perf_counter()}")
+            self.seen_rel_ids.add(rel_id)
 
         if self.tokenizer is not None:
             self._validate_token_prompt(
@@ -1374,8 +1380,6 @@ class LLMEngine:
         assert scheduler_outputs is not None
 
         if not scheduler_outputs.is_empty():
-            logger.info(">> compute engine step")
-
             # Check if we have a cached last_output from the previous iteration.
             # For supporting PP this is probably the best way to pass the
             # sampled_token_ids, as a separate broadcast over all the PP stages
@@ -1407,7 +1411,6 @@ class LLMEngine:
             if self.scheduler_config.is_multi_step:
                 self._update_cached_scheduler_output(virtual_engine, outputs)
         else:
-            logger.info(">> idle engine step")
             # Nothing scheduled => If there is pending async postprocessor,
             # then finish it here.
             if len(ctx.output_queue) > 0:
@@ -1478,9 +1481,15 @@ class LLMEngine:
         if scheduler_outputs.num_prefill_groups == 0:
             # decoding step
             logger.info(f"kkk || num of decode tokens: {scheduler_outputs.running_queue_size}, time elapsed: {elapsed_time:.4f}")
+            iter_type = "decode"
         else:
             # prefill step
             logger.info(f"ccc || num of prefill tokens: {scheduler_outputs.num_uncached_prefill_tokens}, time elapsed: {elapsed_time:.4f}")
+            iter_type = "prefill"
+
+        # for visualization (iter_type, iter_start_ts, iter_duration, iter_rel_ids)
+        scheduled_rel_ids = [ssg.seq_group.rel_id for ssg in scheduler_outputs.scheduled_seq_groups]
+        logger.info(f"vvv || {iter_type};{rel_ts};{elapsed_time};{scheduled_rel_ids}")
 
         return ctx.request_outputs
 

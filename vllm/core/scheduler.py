@@ -86,11 +86,21 @@ class SchedulingBudget:
         self._num_batched_tokens += num_batched_tokens
         self._num_cached_tokens += num_cached_tokens
 
-    def subtract_num_batched_tokens(self, req_id: str,
-                                    num_batched_tokens: int):
-        if req_id in self._request_ids_num_batched_tokens:
-            self._request_ids_num_batched_tokens.remove(req_id)
-            self._num_batched_tokens -= num_batched_tokens
+    def subtract_num_batched_tokens(self,
+                                    req_id: str,
+                                    num_batched_tokens: int,
+                                    num_cached_tokens: int = 0):
+        if req_id not in self._request_ids_num_batched_tokens:
+            return
+        assert num_cached_tokens >= 0
+        assert num_batched_tokens >= 0
+
+        self._request_ids_num_batched_tokens.remove(req_id)
+        self._num_batched_tokens -= num_batched_tokens
+        self._num_cached_tokens -= num_cached_tokens
+
+        assert self._num_batched_tokens >= 0
+        assert self._num_cached_tokens >= 0
 
     def add_num_seqs(self, req_id: str, num_curr_seqs: int):
         if req_id in self._request_ids_num_curr_seqs:
@@ -1064,17 +1074,483 @@ class Scheduler:
             num_lookahead_slots=self._get_num_lookahead_slots(
                 is_prefill=True, enable_chunking=enable_chunking))
 
-    def _schedule_prefills_iso_pabs(
+    def _revert_prefill_seqs(
+        self,
+        seq_groups,
+        budget: SchedulingBudget,
+        record_budget_tx
+    ):
+        """
+        remove the influence of every added seq_groups
+        such revert is required since we need the next batch content to
+        determine whether it is beneficial to overall latency
+
+        related area
+        1. self._allocate_and_set_running ==> deallocate and set waiting
+        2. sg.init_multi_step_from_lookahead_slots ==> ignore since we assert no multi-step
+        3. budget add_seqs and add_tokens ==> remove them
+        """
+        # first deallocate and set waiting
+        for ssg in seq_groups:
+            seq_group = ssg.seq_group
+            """
+            self.block_manager.allocate(seq_group)
+            for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
+                seq.status = SequenceStatus.RUNNING
+            """
+            for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+                seq.status = SequenceStatus.WAITING
+            for seq in seq_group.get_seqs():
+                self.block_manager.free(seq)
+
+        # then recover budget
+        for info in record_budget_tx:
+            req_id, nbt, nct, nns = info
+            budget.subtract_num_batched_tokens(
+                req_id,
+                num_batched_tokens=nbt,
+                num_cached_tokens=nct,
+            )
+            budget.subtract_num_seqs(req_id, nns)
+            
+    def _schedule_prefills_ada_pabs(
         self,
         budget: SchedulingBudget,
-        waiting_relid_cost: List,
+        waiting_relid_cost,
+        overlap_policy,
         curr_loras: Optional[Set[int]],
         enable_chunking: bool = False,
     ) -> SchedulerPrefillOutputs:
         """Schedule sequence groups that are in prefill stage.
-        iso policy: when exist running/decoding relQuery, new prefill will be deferred
+        waiting_relid_cost: all relQuery in the waiting queue and its corresponding priority
 
-        relid2prio_dict contains all priority of relQueries in waiting queue
+        RIDs = rel_ids in running queue
+
+        overlap_policy:
+        * ovlp: vllm style, overlap P & D as much as possible regardless of inter/intra
+        * islt: isolated PD (in priority, it means prefill of lower-prio rQ are deferred)
+        * ada: our proposed adaptive PD control for inter-relQuery
+
+        adaptive logic:
+        * first use traditonal logic to obtain next prefill batch containing only one rel_id
+        * then estimate the latency with and without executing next prefill batch
+        * choose the one with lowest latency
+        * revert self.waiting/budget/block_manager correspondingly
+
+        """
+        assert not self.lora_enabled
+        # TODO: if chunking or multistep, need to properly handle init_multi_step_from_lookahead_slots
+        assert not enable_chunking and not self.scheduler_config.is_multi_step 
+        assert overlap_policy in ["ada", "ovlp", "islt"]
+
+        # obtain number of blocks to reserve for necessary future tokens 
+        NFT = 0
+        for sg in self.running:
+            max_output_tokens = sg.sampling_params.max_tokens
+            cur_seq = sg.get_seqs(status=SequenceStatus.RUNNING)[0]
+            cur_output_tokens = cur_seq.get_output_len()
+            NFT += (max_output_tokens - cur_output_tokens)
+        NFT_blocks = NFT // self.block_manager.block_size + 1
+
+        """
+        First step: construct candidate prefill batch 
+        * for ovlp: construct as usual
+        * for islt & ada: construct a batch containing at most one rel_id
+            * islt: we directly stall the prefill loop when detecting inter-rQ
+            * ada: if intra-rQ, execute prefill as usual; if inter-rQ, we compare
+                  latency to determines whether prefill.
+        """
+        ########################### new logic start
+        only_one_rel_id = overlap_policy in ["ada", "islt"]
+        contained_rel_id = None
+        record_budget_tx = []
+        running_highest_prio = 0xfffffffffffff
+        for sg in self.running:
+            running_highest_prio = min(running_highest_prio, sg.priority)
+        ########################### new logic end
+
+        ignored_seq_groups: List[SequenceGroup] = []
+        seq_groups: List[ScheduledSequenceGroup] = []
+        waiting_queue = self.waiting
+        while self._passed_delay(time.time()) and waiting_queue:
+            seq_group = waiting_queue[0]
+            ########################### new logic start
+            # one batch can only contain one rel_id
+            if only_one_rel_id:
+                if contained_rel_id is None:
+                    contained_rel_id = seq_group.rel_id
+                else:
+                    if seq_group.rel_id != contained_rel_id:
+                        break
+            # islt logic: can only prefill when cold start or no higher-prio is running
+            if overlap_policy == "islt" and seq_group.priority > running_highest_prio:
+                break
+            ########################### new logic end
+
+            waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
+            assert len(waiting_seqs) == 1, (
+                "Waiting sequence group should have only one prompt "
+                "sequence.")
+            num_new_tokens_uncached, num_new_tokens_cached = (
+                self._get_num_new_uncached_and_cached_tokens(
+                    seq_group, SequenceStatus.WAITING, enable_chunking,
+                    budget))
+            num_new_tokens = num_new_tokens_uncached + num_new_tokens_cached
+
+            if not enable_chunking:
+                num_prompt_tokens = waiting_seqs[0].get_len()
+                assert num_new_tokens == num_prompt_tokens
+
+            prompt_limit = self._get_prompt_limit(seq_group)
+            if num_new_tokens > prompt_limit:
+                logger.warning(
+                    "Input prompt (%d tokens) is too long"
+                    " and exceeds limit of %d", num_new_tokens, prompt_limit)
+                for seq in waiting_seqs:
+                    seq.status = SequenceStatus.FINISHED_IGNORED
+                ignored_seq_groups.append(seq_group)
+                waiting_queue.popleft()
+                continue
+
+            num_lookahead_slots: int = 0
+            if self.scheduler_config.is_multi_step and enable_chunking:
+                num_lookahead_slots = self._get_num_lookahead_slots(
+                    True, enable_chunking)
+
+            ########################### new logic start
+            # before checking can_allocate, check reserved space for NFT
+            if self.block_manager.get_num_free_gpu_blocks() < NFT_blocks:
+                break
+            ########################### new logic end
+
+            # If the sequence group cannot be allocated, stop.
+            can_allocate = self.block_manager.can_allocate(
+                seq_group, num_lookahead_slots=num_lookahead_slots)
+            if can_allocate == AllocStatus.LATER:
+                break
+            elif can_allocate == AllocStatus.NEVER:
+                logger.warning(
+                    "Input prompt (%d tokens) + lookahead slots (%d) is "
+                    "too long and exceeds the capacity of block_manager",
+                    num_new_tokens, num_lookahead_slots)
+                for seq in waiting_seqs:
+                    seq.status = SequenceStatus.FINISHED_IGNORED
+                ignored_seq_groups.append(seq_group)
+                waiting_queue.popleft()
+                continue
+
+            if (budget.num_batched_tokens >=
+                    self.scheduler_config.max_num_batched_tokens):
+                # We've reached the budget limit - since there might be
+                # continuous prefills in the running queue, we should break
+                # to avoid scheduling any new prefills.
+                break
+
+            num_new_seqs = seq_group.get_max_num_running_seqs()
+            if num_new_tokens_uncached == 0 or not budget.can_schedule(
+                    num_new_tokens=num_new_tokens_uncached,
+                    num_new_seqs=num_new_seqs,
+            ):
+                break
+
+            # Can schedule this request.
+            waiting_queue.popleft()
+            self._allocate_and_set_running(seq_group)
+
+            if enable_chunking and self.scheduler_config.is_multi_step:
+                blocks_to_copy: List[Tuple[int, int]] = []
+                # init_multi_step_from_lookahead_slots happens in append_slots
+                self._append_slots(seq_group, blocks_to_copy, enable_chunking)
+                # This assert will trip when a copy-on-write happens. This is
+                # not a concern as the very first sequence-group block
+                # allocation happens above. Still, we have the assert to
+                # catch any edge-cases.
+                assert not blocks_to_copy
+            else:
+                seq_group.init_multi_step_from_lookahead_slots(
+                    num_lookahead_slots,
+                    num_scheduler_steps=self.scheduler_config.num_scheduler_steps,
+                    is_multi_step=self.scheduler_config.is_multi_step,
+                    enable_chunking=enable_chunking)
+
+            seq_groups.append(
+                ScheduledSequenceGroup(seq_group=seq_group,
+                                       token_chunk_size=num_new_tokens))
+            budget.add_num_batched_tokens(
+                seq_group.request_id,
+                num_batched_tokens=num_new_tokens_uncached,
+                num_cached_tokens=num_new_tokens_cached,
+            )
+            budget.add_num_seqs(seq_group.request_id, num_new_seqs)
+            ########################### new logic start
+            if overlap_policy != "ovlp":
+                record_budget_tx.append((seq_group.request_id,
+                                         num_new_tokens_uncached,
+                                         num_new_tokens_cached,
+                                         num_new_seqs))
+            ########################### new logic end
+
+        ########################### new logic start
+        is_inter = False
+        if overlap_policy == "ovlp":
+            # overlap as much as possible, execute the batch directly
+            logger.info("overlap PD amap")
+        elif overlap_policy == "islt":
+            # isolate execution, logic in the loop ensures that (1) seq_groups
+            # contain only one rel_id (2) new batch have higher priority
+            # than running, so no additional disposal here
+            # ==> FIXME: not tailored for fcfs scheduling
+            logger.info("isolate PD amap")
+        else:
+            # adaptive determination, maybe need to revert current prefill batch
+            logger.info("adaptive PD control")
+            # when (1) cold start (2) empty prefill batch (3) intra-rQ, no need
+            # to compare latency
+            if len(seq_groups) == 0:
+                logger.info(f"no comp: no KV space for prefill")
+            else:
+                if len(self.running) == 0:
+                    logger.info("no comp: cold start")
+                else:
+                    # if running contains higher priority rQs, then this is inter relQuery
+                    if seq_groups[0].seq_group.priority > running_highest_prio:
+                        is_inter = True
+                        logger.info("do comp: inter-relQuery")
+                    else:
+                        logger.info("no comp: intra-relQuery")
+
+        if is_inter:
+            tick = time.perf_counter()
+            """
+            by now, self.running content is not modified, but self.waiting content is changed
+            (1) the update_priroirty function already predicts the latency without next prefill batch
+            (2) with new prefill batch formed, the KV blocks are changed, and we need to recalculate 
+                for only the first relQuery whose rel_id is the same as that in next prefill batch
+            """
+            no_overlap_latency = self.predict_no_overlap_latency(waiting_relid_cost)
+            overlap_latency = self.predict_with_overlap_latency(seq_groups, waiting_relid_cost, record_budget_tx)
+            do_overlap = overlap_latency < no_overlap_latency
+            if not do_overlap:
+                # revert influence of next prefill batch
+                self._revert_prefill_seqs(seq_groups, budget, record_budget_tx)
+                # move seq_group back to waiting
+                while seq_groups:
+                    x = seq_groups.pop()
+                    self.waiting.appendleft(x.seq_group)
+            dur = time.perf_counter() - tick
+            logger.info(f"no_overlap_latency: {no_overlap_latency}, overlap_latency: {overlap_latency}, do_overlap: {do_overlap}, overhead: {dur:.5f}")
+        ########################### new logic end
+
+        if len(seq_groups) > 0:
+            self.prev_prompt = True
+
+        return SchedulerPrefillOutputs(
+            seq_groups=seq_groups,
+            ignored_seq_groups=ignored_seq_groups,
+            num_lookahead_slots=self._get_num_lookahead_slots(
+                is_prefill=True, enable_chunking=enable_chunking))
+
+    def predict_with_overlap_latency(self, next_prefill_batch, waiting_relid_cost, record_budget_tx):
+        """
+        ontain overall latency by:
+        * first execute the next prefill batch
+        * then execute the running queries
+        * then execute the waiting queries
+        """
+        offset = 0
+        total_latency = 0
+
+        slope_decode, intercept_decode = self.scheduler_config.info_decode
+        slope_prefill, intercept_prefill = self.scheduler_config.info_prefill
+
+        # 1. next prefill batch's time
+        prefill_num_tokens = sum(x[1] for x in record_budget_tx)
+        offset += prefill_num_tokens * slope_prefill + intercept_prefill
+
+        # 2. running relqueries' time, offseted by prefill's time
+        highest_prio_in_waiting = waiting_relid_cost[0][1]
+        #    filter out low prio reqs
+        running_queries = defaultdict(list)
+        for sg in self.running:
+            if sg.priority > highest_prio_in_waiting:
+                continue
+            running_queries[sg.rel_id].append(sg)
+        #    obtain leftover length for each rQ
+        running_queries_leftover_length = dict()
+        for rid, sgs in running_queries.items():
+            max_output_len = max(sg.sampling_params.max_tokens - sg.get_seqs()[0].get_output_len()
+                    for sg in sgs)
+            running_queries_leftover_length[rid] = max_output_len
+        #    calc latency for each rQ
+        decoding_bs = len(self.running) + len(next_prefill_batch)
+        for rid, max_output_len in running_queries_leftover_length.items():
+            cur_latency = offset + max_output_len * (slope_decode * decoding_bs + intercept_decode)
+            total_latency += cur_latency
+            offset = max(offset, cur_latency)
+
+        # 3. calculate latency for each waiting query
+        """
+        now waiting is changed slightly: the most fronted relQuery has fewer (down to 0) reqs
+        due to next prefill batch; for other rQs, nothing is changed
+        """
+        remaining_front_rq = [sg for sg in self.waiting if sg.rel_id == next_prefill_batch[0].seq_group.rel_id]
+        # leftover partial reqs' workload (decoding)
+        max_output_len_running = max(running_queries_leftover_length.values())
+        inserted_batch_output_len = next_prefill_batch[0].seq_group.sampling_params.max_tokens - 1
+        partial_workload_front_rq = 0
+        if max_output_len_running < inserted_batch_output_len:
+            # need extra decoding steps for next_prefill_batch
+            partial_workload_front_rq += (inserted_batch_output_len - max_output_len_running) * \
+                    (slope_decode * len(next_prefill_batch) + intercept_decode)
+        # leftover intact reqs' workload (prefill + decode)
+        intact_workload_front_rq = self._calc_single_query_priority(remaining_front_rq)
+        whole_workload_front_rq = partial_workload_front_rq + intact_workload_front_rq
+        if len(remaining_front_rq):
+            # update the first relQuery's execution 
+            new_tp = (waiting_relid_cost[0][0], whole_workload_front_rq)
+            waiting_relid_cost[0] = new_tp
+        else:
+            # insert one to the head!
+            waiting_relid_cost.insert(0, (next_prefill_batch[0].seq_group.rel_id, whole_workload_front_rq))
+
+        # for each of waiting rQ, its latency is: waiting time (offset) + execution time
+        for rid, duration in waiting_relid_cost:
+            cur_latency = offset + duration
+            total_latency += cur_latency
+            offset += duration
+
+        return total_latency
+
+    def predict_no_overlap_latency(self, waiting_relid_cost):
+        """
+        obtain overall latency by:
+        * execute remaining decoding steps first
+        * then sequentially execute waiting relQueries 
+
+        note that
+        * there maybe some preempted rQs in running
+        * we ignore them since they do not delay others
+        """
+        highest_prio_in_waiting = waiting_relid_cost[0][1]
+        running_queries = defaultdict(list)
+        for sg in self.running:
+            if sg.priority > highest_prio_in_waiting:
+                # ignore low prio ones
+                continue
+            running_queries[sg.rel_id].append(sg)
+
+        running_queries_leftover_length = dict()
+        for rid, sgs in running_queries.items():
+            max_output_len = max(sg.sampling_params.max_tokens - sg.get_seqs()[0].get_output_len()
+                    for sg in sgs)
+            running_queries_leftover_length[rid] = max_output_len
+
+        slope_decode, intercept_decode = self.scheduler_config.info_decode
+        total_latency = 0
+        offset = 0
+
+        # first sum the latency of running ones, here no waiting
+        decoding_bs = len(self.running)
+        for rid, max_output_len in running_queries_leftover_length.items():
+            cur_latency = max_output_len * (slope_decode * decoding_bs + intercept_decode)
+            total_latency += cur_latency
+            offset = max(offset, cur_latency)
+
+        # for each of waiting rQ, its latency is: waiting time (offset) + execution time
+        for rid, duration in waiting_relid_cost:
+            cur_latency = offset + duration
+            total_latency += cur_latency
+            offset += duration
+        return total_latency
+
+
+    def predict_global_latency(next_prefill_batch, delayed_prefill_batch):
+        """
+        not utilized, keep here for future reference because T2's calculation is more accurate than that 
+        in predict_with_overlap_latency and predict_no_overlap_latency
+
+        consider relQueries from (a) self.running (b) next_prefill_batch (c) self.waiting + delayed_prefill_batch
+        return a global summed latency
+
+        latency comes from: (1) execute next_prefill_batch (2) execute self.running (3) execute other waiting ones
+
+        (1): straightforward, gather #tokens to compute, linear prediction, T1
+        (2): now relQueries in both (a) and (b) are decoding, but deferred by T1, we denote T2 as the last finish time 
+        (3): combine of individual relQuery's priority value, but all deferred by T1+T2
+        
+        note that for (2), we assume isolation execution; for (3), the cache content change should be reflected
+        """
+        ts = time.perf_counter()
+        slope_prefill, intercept_prefill = self.scheduler_config.info_prefill
+        slope_decode, intercept_decode = self.scheduler_config.info_decode
+
+        # T1 calculation
+        next_prefill_batch_tokens = 0
+        for sg in next_prefill_batch:
+            num_uncached_new_tokens, num_cached_new_tokens = \
+                self._pure_get_num_new_uncached_and_cached_tokens(
+                    sg, SequenceStatus.WAITING)
+            next_prefill_batch_tokens += num_uncached_new_tokens
+        T1 = slope_prefill * next_prefill_batch_tokens + intercept_prefill
+
+        # T2 calculation & all running relQuery's latency
+        max_decode_steps = 0
+        all_running_info = [] # extract (rel_id, remaining steps)
+        for sg in self.running:
+            remaining_decode_steps = sg.sampling_params.max_tokens - sg.get_output_len()
+            all_running_info.append((sg.rel_id, remaining_decode_steps))
+            max_decode_steps = max(max_decode_steps, remaining_decode_steps)
+        for sg in next_prefill_batch:
+            remaining_decode_steps = sg.sampling_params.max_tokens - 1
+            all_running_info.append((sg.rel_id, remaining_decode_steps))
+            max_decode_steps = max(max_decode_steps, remaining_decode_steps)
+
+        per_iteration_bs = [0] * (max_decode_steps + 2)
+        rel_id_to_max_steps = {rid:0 for rid, _ in all_running_info}
+        for rid, rs in all_running_info:
+            rel_id_to_max_steps[rid] = max(rel_id_to_max_steps[rid], rs)
+            for i in range(rs):
+                per_iteration_bs[i] += 1
+        
+        for pib in per_iteration_bs:
+            T2 += pib * slope_decode + intercept_decode
+
+        running_rel_id_to_latency = dict()
+        waiting_rids = set([x.rel_id for x in delayed_prefill_batch + self.waiting])
+        for rid, ms in rel_id_to_max_steps.items():
+            if rid in waiting_rids:
+                # if still have some unfinished sg, then latency is not determined yet
+                continue
+            running_rel_id_to_latency[rid] = sum(per_iteration_bs[:ms]) * slope_decode + \
+                    intercept_decode + T1
+
+        # for all other waiting relQueries, obtain their individual latency
+        waiting_relQueries = {rid:[] for rid in waiting_rids}
+        for sg in delayed_prefill_batch + self.waiting:
+            waiting_relQueries[sg.rel_id].append(sg)
+
+        waiting_rel_id_to_latency = dict() # execution duration for each relQuery
+        prev_accum = 0 # accumulate the latency
+        for rid, rQ in waiting_relQueries.items():
+            single_duration = predict_single_relQuery_latency(rQ) #TODO, should be simple!
+            waiting_rel_id_to_latency[rid] = T1 + T2 + prev_accum + single_duration
+            prev_accum += single_duration
+
+        return sum(list(running_rel_id_to_latency.values()) + list(waiting_rel_id_to_latency.values()))
+
+
+    def _schedule_prefills_iso_pabs(
+        self,
+        budget: SchedulingBudget,
+        curr_loras: Optional[Set[int]],
+        enable_chunking: bool = False,
+    ) -> SchedulerPrefillOutputs:
+        """Schedule sequence groups that are in prefill stage.
+        !!! problematic !!!: actually defer the first prefill batch that completely contains no running relQuery.
+        Even if insert_prefill = True, it is still possible that current prefill batch contain partial running 
+        and partial other requests
+
+        iso policy: when exist running/decoding relQuery, new prefill will be deferred
 
         WID = rel_id with highest prio in waiting queue
         RIDs = rel_ids in running queue
@@ -1085,9 +1561,9 @@ class Scheduler:
         """
         # by default we insert prefill: (1) intra-relQuery (2) empty waiting (3) empty running
         insert_prefill = True
-        if len(waiting_relid_cost):
+        if len(self.waiting):
             # highest priority rel_id and cost in waiting queue
-            WID, WPRIO = waiting_relid_cost[0] 
+            WID = self.waiting[0].rel_id # self.waiting already sorted before schedule_running/_prefill
             RIDs = [x.rel_id for x in self.running]
             if len(RIDs) and WID not in RIDs:
                 # inter-relQuery execution
@@ -1244,6 +1720,9 @@ class Scheduler:
         enable_chunking: bool = False,
     ) -> SchedulerPrefillOutputs:
         """Schedule sequence groups that are in prefill stage.
+
+        !!!! problematic! self.running[0] does not necessarily mean the current relQuery, maybe half
+        preempted ones...
 
         (1) if we prevent the prefill of next relQuery until the decode of
             current query are finished, experiment results are bad
@@ -1828,7 +2307,53 @@ class Scheduler:
         subsequent_batch_cache_miss_ratio = max(overlap_ratio, first_batch_cache_miss_ratio)
         return (first_batch_cache_miss_ratio, subsequent_batch_cache_miss_ratio)
 
-     
+    def _calc_single_query_priority(self, target_sg_list):
+        """
+        given a list, return the abs priority
+        """
+        if len(target_sg_list) == 0:
+            return 0
+
+        slope_prefill, intercept_prefill = self.scheduler_config.info_prefill
+        slope_decode, intercept_decode = self.scheduler_config.info_decode
+
+        first_cache_miss_ratio, subsequent_cache_miss_ratio = self._compute_cache_miss(target_sg_list)
+        assert len(set(sg.rel_id for sg in target_sg_list)) == 1, "Not single relQuery"
+
+        cost = 0
+        cur_batch_prefill_tokens = 0
+        cur_batch_num_seqs = 0
+        cur_batch_max_output_len = 0
+        for sg in target_sg_list:
+            if cost == 0:
+                # first batch
+                uncache_tokens = sg.get_seqs()[0].get_prompt_len() * first_cache_miss_ratio
+            else:
+                # subsequent batch
+                uncache_tokens = sg.get_seqs()[0].get_prompt_len() * subsequent_cache_miss_ratio
+
+            if cur_batch_prefill_tokens + uncache_tokens > self.scheduler_config.max_model_len:
+                # prefill cost
+                cost += cur_batch_prefill_tokens * slope_prefill + intercept_prefill
+                # decode cost
+                cost += (cur_batch_num_seqs * slope_decode + intercept_decode) * cur_batch_max_output_len
+                # reset 
+                cur_batch_prefill_tokens = 0
+                cur_batch_num_seqs = 0
+                cur_batch_max_output_len = 0
+            # batching
+            cur_batch_prefill_tokens += uncache_tokens
+            cur_batch_num_seqs += 1
+            cur_batch_max_output_len = max(cur_batch_max_output_len, sg.sampling_params.max_tokens)
+
+        # leftover
+        if cur_batch_num_seqs:
+            cost += cur_batch_prefill_tokens * slope_prefill + intercept_prefill
+            cost += (cur_batch_num_seqs * slope_decode + intercept_decode ) * cur_batch_max_output_len
+
+        return cost
+
+
     def _update_query_priority_abs(self, staleness_bound=-1):
         """
         args:
@@ -1841,6 +2366,10 @@ class Scheduler:
                 (a). if no historical data is available/staleness_bound exceeded, compute cache miss
                 (b). if found historical data, reuse at most staleness_bound times
             (2) with the cache miss rate, directly derive #batches, and the cost
+
+        modification:
+            * for each of running relQuery: if its rel_id exists in waiting, set its priority the same
+            as the waiting; otherwise, set its priority as remaining decoding time
         """
         ts = time.perf_counter()
         slope_prefill, intercept_prefill = self.scheduler_config.info_prefill
@@ -1903,6 +2432,25 @@ class Scheduler:
         for rel_id, _ in sorted(record_relid_cost, key=lambda x:x[1]):
             new_waiting += waiting_queries[rel_id]
         self.waiting = deque(new_waiting)
+
+        # new added: update running queries as well
+        running_queries = defaultdict(list)
+        wait_rq_dict = {rid:prio for rid, prio in record_relid_cost}
+        for sg in self.running:
+            running_queries[sg.rel_id].append(sg)
+        for rid, sgs in running_queries.items():
+            if rid in wait_rq_dict:
+                # use waiting priority
+                for sg in sgs:
+                    sg.priority = wait_rq_dict[rid]
+            else:
+                # calculate new priority and update
+                decoding_bs = len(self.running)
+                leftover_num_steps = max(sg.sampling_params.max_tokens - sg.get_seqs()[0].get_output_len()
+                        for sg in sgs)
+                leftover_cost = leftover_num_steps * (slope_decode * decoding_bs + intercept_decode)
+                for sg in sgs:
+                    sg.priority = leftover_cost
         
         elapsed_time = time.perf_counter() - ts
         logger.info(f"priority updating overhead in seconds: {elapsed_time}")
@@ -2041,16 +2589,20 @@ class Scheduler:
             return self._schedule_default_old()
 
         logger.info("%"*30+"xzhanggb"+"%"*30)
-        assert self.scheduler_config.policy in ['priority_tc', 'priority_bs', 'priority_abs', 'priority_pabs', 'priority_ipabs', 'priority_iso_pabs']
+        assert self.scheduler_config.policy in ['priority_tc', 'priority_bs', 'priority_abs', 'priority_pabs', 
+                'priority_ipabs', 'priority_iso_pabs', 'priority_ada_pabs', 'priority_islt_pabs', 'priority_ovlp_pabs']
         assert not self.lora_enabled
         assert not self.swapped
         curr_loras = None
 
-        if self.scheduler_config.policy == "priority_iso_pabs":
+        if self.scheduler_config.policy in ["priority_abs", "priority_pabs", "priority_iso_pabs", "priority_ipabs", 
+                "priority_ada_pabs", "priority_islt_pabs", "priority_ovlp_pabs"]:
             """
-            iso: next relQuery's prefill starts only after previous
-                relQuery's decode finishes
-            pabs: approx batch simulation + preempt prevention
+            abs: approximate batch simulation, always prioritize prefill
+            pabs: preempt prevention + abs
+            iso_pabs: next relQuery's prefill starts only after previous relQuery's decode finishes
+            ipabs: isolation happens only when previous decode is short
+            ada_pabs: cost model guided PD scheduling
             """
             # Include running requests to the budget.
             budget = SchedulingBudget(
@@ -2058,6 +2610,7 @@ class Scheduler:
                 max_num_seqs=self.scheduler_config.max_num_seqs,
             )
 
+            # Update the priority for waiting relQueries
             assert len(self.scheduler_config.info_prefill) == 2
             assert len(self.scheduler_config.info_decode) == 2
             waiting_relid_cost = self._update_query_priority_abs()
@@ -2073,95 +2626,23 @@ class Scheduler:
             swapped_in = SchedulerSwappedInOutputs.create_empty()
 
             # prefill
-            prefills = self._schedule_prefills_iso_pabs(budget,
-                                               waiting_relid_cost,
-                                               curr_loras,
-                                               enable_chunking=False)
-
-        elif self.scheduler_config.policy == "priority_ipabs":
-            """
-            pabs with: prevent prefill of next relQuery if current decode length is short
-            """
-            # Include running requests to the budget.
-            budget = SchedulingBudget(
-                token_budget=self.scheduler_config.max_num_batched_tokens,
-                max_num_seqs=self.scheduler_config.max_num_seqs,
-            )
-
-            assert len(self.scheduler_config.info_prefill) == 2
-            assert len(self.scheduler_config.info_decode) == 2
-            self._update_query_priority_abs()
-
-            # Make sure we include num running seqs before scheduling prefill,
-            # so that we don't schedule beyond max_num_seqs for prefill.
-            for seq_group in self.running:
-                budget.add_num_seqs(seq_group.request_id,
-                                    seq_group.get_max_num_running_seqs())
-
-            prefills = SchedulerPrefillOutputs.create_empty()
-            running_scheduled = SchedulerRunningOutputs.create_empty()
-            swapped_in = SchedulerSwappedInOutputs.create_empty()
-
-            # prefill
-            prefills = self._schedule_prefills_ipabs(budget,
-                                               curr_loras,
-                                               enable_chunking=False)
-        
-        elif self.scheduler_config.policy == "priority_pabs":
-            """
-            abs with preemption prevention
-            """
-            # Include running requests to the budget.
-            budget = SchedulingBudget(
-                token_budget=self.scheduler_config.max_num_batched_tokens,
-                max_num_seqs=self.scheduler_config.max_num_seqs,
-            )
-
-            assert len(self.scheduler_config.info_prefill) == 2
-            assert len(self.scheduler_config.info_decode) == 2
-            self._update_query_priority_abs()
-
-            # Make sure we include num running seqs before scheduling prefill,
-            # so that we don't schedule beyond max_num_seqs for prefill.
-            for seq_group in self.running:
-                budget.add_num_seqs(seq_group.request_id,
-                                    seq_group.get_max_num_running_seqs())
-
-            prefills = SchedulerPrefillOutputs.create_empty()
-            running_scheduled = SchedulerRunningOutputs.create_empty()
-            swapped_in = SchedulerSwappedInOutputs.create_empty()
-
-            # prefill with preempt prevention
-            prefills = self._schedule_prefills_pabs(budget,
-                                               curr_loras,
-                                               enable_chunking=False)
-
-        elif self.scheduler_config.policy == "priority_abs":
-            # Include running requests to the budget.
-            budget = SchedulingBudget(
-                token_budget=self.scheduler_config.max_num_batched_tokens,
-                max_num_seqs=self.scheduler_config.max_num_seqs,
-            )
-
-            assert len(self.scheduler_config.info_prefill) == 2
-            assert len(self.scheduler_config.info_decode) == 2
-            self._update_query_priority_abs()
-
-            # Make sure we include num running seqs before scheduling prefill,
-            # so that we don't schedule beyond max_num_seqs for prefill.
-            for seq_group in self.running:
-                budget.add_num_seqs(seq_group.request_id,
-                                    seq_group.get_max_num_running_seqs())
-
-            prefills = SchedulerPrefillOutputs.create_empty()
-            running_scheduled = SchedulerRunningOutputs.create_empty()
-            swapped_in = SchedulerSwappedInOutputs.create_empty()
-
-            # prefill without preemption
-            #prefills = self._schedule_prefills_separated(budget,
-            prefills = self._schedule_prefills(budget,
-                                               curr_loras,
-                                               enable_chunking=False)
+            if self.scheduler_config.policy in ["priority_ada_pabs", "priority_ovlp_pabs", "priority_islt_pabs"]:
+                overlap_policy = self.scheduler_config.policy.split("_")[1]
+                prefills = self._schedule_prefills_ada_pabs(budget,
+                        waiting_relid_cost,
+                        overlap_policy,
+                        curr_loras=None,
+                        enable_chunking=False)
+            else:
+                prefill_sched_function = {
+                        'priority_abs':self._schedule_prefills,
+                        'priority_pabs':self._schedule_prefills_pabs, 
+                        'priority_iso_pabs':self._schedule_prefills_iso_pabs,
+                        'priority_ipabs':self._schedule_prefills_ipabs,
+                        }
+                prefills = prefill_sched_function[self.scheduler_config.policy](budget,
+                        curr_loras=None,
+                        enable_chunking=False)
 
         elif self.scheduler_config.policy == "priority_tc" :
             """

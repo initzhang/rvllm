@@ -1164,9 +1164,9 @@ class Scheduler:
         only_one_rel_id = overlap_policy in ["ada", "islt"]
         contained_rel_id = None
         record_budget_tx = []
-        running_highest_prio = 0xfffffffffffff
-        for sg in self.running:
-            running_highest_prio = min(running_highest_prio, sg.priority)
+        RIDs = set(sg.rel_id for sg in self.running)
+        WIDs = set(x[0] for x in waiting_relid_cost)
+        tailed_workload_rids = RIDs - WIDs # leftover workload of high prio rQ
         ########################### new logic end
 
         ignored_seq_groups: List[SequenceGroup] = []
@@ -1181,10 +1181,25 @@ class Scheduler:
                     contained_rel_id = seq_group.rel_id
                 else:
                     if seq_group.rel_id != contained_rel_id:
+                        logger.info(f"one rel_id constraint break prefill loop: attempted {seq_group.rel_id} contained {contained_rel_id}")
                         break
             # islt logic: can only prefill when cold start or no higher-prio is running
-            if overlap_policy == "islt" and seq_group.priority > running_highest_prio:
-                break
+            if overlap_policy == "islt":
+                if len(self.running) == 0:
+                    # cold start
+                    pass
+                else:
+                    if self.running[-1].rel_id == seq_group.rel_id:
+                        # intra-rQ
+                        pass
+                    else:
+                        if len(tailed_workload_rids) == 0:
+                            # running rQs are all preempted ones, safe to prefill
+                            pass
+                        else:
+                            # inter-rQ: at least one running rQ is tailed workload
+                            logger.info(f"islt break prefill loop: detect tailed workload {tailed_workload_rids}")
+                            break
             ########################### new logic end
 
             waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
@@ -1219,7 +1234,9 @@ class Scheduler:
 
             ########################### new logic start
             # before checking can_allocate, check reserved space for NFT
-            if self.block_manager.get_num_free_gpu_blocks() < NFT_blocks:
+            cur_free_num_blocks = self.block_manager.get_num_free_gpu_blocks()
+            if cur_free_num_blocks < NFT_blocks:
+                logger.info(f"NFT break prefill loop: NFT_blocks: {NFT_blocks}, current free blocks: {cur_free_num_blocks}")
                 break
             ########################### new logic end
 
@@ -1304,20 +1321,23 @@ class Scheduler:
         else:
             # adaptive determination, maybe need to revert current prefill batch
             logger.info("adaptive PD control")
+            # need to detect inter-rQ timestamp
             # when (1) cold start (2) empty prefill batch (3) intra-rQ, no need
-            # to compare latency
             if len(seq_groups) == 0:
                 logger.info(f"no comp: no KV space for prefill")
             else:
                 if len(self.running) == 0:
                     logger.info("no comp: cold start")
                 else:
-                    # if running contains higher priority rQs, then this is inter relQuery
-                    if seq_groups[0].seq_group.priority > running_highest_prio:
-                        is_inter = True
-                        logger.info("do comp: inter-relQuery")
-                    else:
+                    if self.running[-1].rel_id == seq_groups[0].seq_group.rel_id:
                         logger.info("no comp: intra-relQuery")
+                    else:
+                        if len(tailed_workload_rids):
+                            is_inter = True
+                            logger.info("do comp: inter-relQuery")
+                        else:
+                            # actually preempt low prio rQs
+                            logger.info("no comp: intra-relQuery (preempt)")
 
         if is_inter:
             tick = time.perf_counter()
@@ -1330,6 +1350,7 @@ class Scheduler:
             no_overlap_latency = self.predict_no_overlap_latency(waiting_relid_cost)
             overlap_latency = self.predict_with_overlap_latency(seq_groups, waiting_relid_cost, record_budget_tx)
             do_overlap = overlap_latency < no_overlap_latency
+            #no_overlap_latency, overlap_latency, do_overlap = 0, 0, False
             if not do_overlap:
                 # revert influence of next prefill batch
                 self._revert_prefill_seqs(seq_groups, budget, record_budget_tx)
@@ -1357,6 +1378,7 @@ class Scheduler:
         * then execute the running queries
         * then execute the waiting queries
         """
+        logger.info(f"next batch #tokens: {sum(x[1] for x in record_budget_tx)}")
         offset = 0
         total_latency = 0
 
@@ -1368,11 +1390,11 @@ class Scheduler:
         offset += prefill_num_tokens * slope_prefill + intercept_prefill
 
         # 2. running relqueries' time, offseted by prefill's time
-        highest_prio_in_waiting = waiting_relid_cost[0][1]
-        #    filter out low prio reqs
+        WIDs = set(x[0] for x in waiting_relid_cost)
+        #    filter out preempted ones
         running_queries = defaultdict(list)
         for sg in self.running:
-            if sg.priority > highest_prio_in_waiting:
+            if sg.rel_id in WIDs:
                 continue
             running_queries[sg.rel_id].append(sg)
         #    obtain leftover length for each rQ
@@ -1405,13 +1427,11 @@ class Scheduler:
         # leftover intact reqs' workload (prefill + decode)
         intact_workload_front_rq = self._calc_single_query_priority(remaining_front_rq)
         whole_workload_front_rq = partial_workload_front_rq + intact_workload_front_rq
-        if len(remaining_front_rq):
-            # update the first relQuery's execution 
-            new_tp = (waiting_relid_cost[0][0], whole_workload_front_rq)
-            waiting_relid_cost[0] = new_tp
-        else:
-            # insert one to the head!
-            waiting_relid_cost.insert(0, (next_prefill_batch[0].seq_group.rel_id, whole_workload_front_rq))
+
+        # include each rid's time and check
+        # for the most front rQ, its workload is changed
+        new_tp = (waiting_relid_cost[0][0], whole_workload_front_rq)
+        waiting_relid_cost[0] = new_tp
 
         # for each of waiting rQ, its latency is: waiting time (offset) + execution time
         for rid, duration in waiting_relid_cost:
@@ -1432,10 +1452,11 @@ class Scheduler:
         * we ignore them since they do not delay others
         """
         highest_prio_in_waiting = waiting_relid_cost[0][1]
+        WIDs = set(x[0] for x in waiting_relid_cost)
         running_queries = defaultdict(list)
         for sg in self.running:
-            if sg.priority > highest_prio_in_waiting:
-                # ignore low prio ones
+            if sg.rel_id in WIDs:
+                # ignore unfinished waiting ones
                 continue
             running_queries[sg.rel_id].append(sg)
 
@@ -2367,7 +2388,7 @@ class Scheduler:
                 (b). if found historical data, reuse at most staleness_bound times
             (2) with the cache miss rate, directly derive #batches, and the cost
 
-        modification:
+        modification: (removed)
             * for each of running relQuery: if its rel_id exists in waiting, set its priority the same
             as the waiting; otherwise, set its priority as remaining decoding time
         """
@@ -2428,12 +2449,14 @@ class Scheduler:
                 sg.priority = cost
             record_relid_cost.append((rel_id, cost))
 
+        sorted_record = sorted(record_relid_cost, key=lambda x:x[1])
         new_waiting = []
-        for rel_id, _ in sorted(record_relid_cost, key=lambda x:x[1]):
+        for rel_id, _ in sorted_record:
             new_waiting += waiting_queries[rel_id]
         self.waiting = deque(new_waiting)
 
         # new added: update running queries as well
+        """
         running_queries = defaultdict(list)
         wait_rq_dict = {rid:prio for rid, prio in record_relid_cost}
         for sg in self.running:
@@ -2451,10 +2474,11 @@ class Scheduler:
                 leftover_cost = leftover_num_steps * (slope_decode * decoding_bs + intercept_decode)
                 for sg in sgs:
                     sg.priority = leftover_cost
+        """
         
         elapsed_time = time.perf_counter() - ts
-        logger.info(f"priority updating overhead in seconds: {elapsed_time}")
-        return sorted(record_relid_cost, key=lambda x:x[1])
+        logger.info(f"priority updating overhead in seconds: {elapsed_time}, relid_cost: {sorted_record}")
+        return sorted_record
 
     def _update_query_priority_bs(self, max_sim_steps=0):
         """

@@ -1157,12 +1157,15 @@ class Scheduler:
         self,
         budget: SchedulingBudget,
         waiting_relid_cost,
+        running_relid_cost,
         overlap_policy,
         curr_loras: Optional[Set[int]],
         enable_chunking: bool = False,
     ) -> SchedulerPrefillOutputs:
         """Schedule sequence groups that are in prefill stage.
         waiting_relid_cost: all relQuery in the waiting queue and its corresponding priority
+        running_relid_cost: all relQueries that only exist in running queue and its priority
+        both are List[(relid, priority)]
 
         overlap_policy: (FIXME: islt only for priority scheduling, not sure for fcfs scheduling)
         * ovlp: vllm style, overlap P & D as much as possible regardless of inter/intra-rQ
@@ -1202,18 +1205,13 @@ class Scheduler:
             # both need to detect inter-rQ
             only_one_rel_id = True
             contained_rel_id = None
-            RIDs = set(sg.rel_id for sg in self.running)
-            WIDs = set(x[0] for x in waiting_relid_cost)
-            #FIXME: tailed_workloads may have longer time than waiting, thus not definitely high-prio
-            tailed_workload_rids = RIDs - WIDs # leftover workload of high prio rQ
-
             is_inter = False
-            if len(self.running) and len(self.waiting) and self.running[0].rel_id != self.waiting[0].rel_id and len(tailed_workload_rids):
+            if len(waiting_relid_cost) and len(running_relid_cost) and running_relid_cost[0][1] < waiting_relid_cost[0][1]:
                 """
-                if len(self.running) == 0: cold start
-                if len(self.waiting) == 0: nothing to decide, must be decode
-                if self.running[0].rel_id == self.waiting[0].rel_id: intra-rQ
-                if len(tailed_workload_rids) == 0: running rQs are all preempted ones
+                if len(waiting_relid_cost) == 0: nothing to decide, must be decode
+                if len(running_relid_cost) == 0: either none is running, or running rQ has unfinished reqs in waiting, intra-rQ
+                if running_relid_cost[0][1] > waiting_relid_cost[0][1]: preempt a decoding rQ
+                actually this criteria tends to overlap: waiting_relid_cost[0]'s priority does not include its running part
                 """
                 is_inter = True
                 logger.info(f"inter-rQ")
@@ -2322,6 +2320,8 @@ class Scheduler:
 
     def _update_query_priority_abs(self, staleness_bound=-1):
         """
+        update priority for waiting relQueries
+
         args:
             * staleness_bound: reuse historical data for at most given times, then requires update
             * -1 means always recompute cache miss ratio without reuse
@@ -2333,11 +2333,7 @@ class Scheduler:
                 (b). if found historical data, reuse at most staleness_bound times
             (2) with the cache miss rate, directly derive #batches, and the cost
 
-        modification:
-            * for each of running relQuery: if its rel_id exists in waiting, set its priority the same
-            as the waiting; otherwise, set its priority as remaining decoding time
         """
-        ts = time.perf_counter()
         slope_prefill, intercept_prefill = self.scheduler_config.info_prefill
         slope_decode, intercept_decode = self.scheduler_config.info_decode
 
@@ -2400,10 +2396,20 @@ class Scheduler:
             new_waiting += waiting_queries[rel_id]
         self.waiting = deque(new_waiting)
 
-        # new added: update running queries as well
+        return sorted_record
+
+    def _update_running_priority_abs(self, waiting_relid_cost):
         """
+        for each running relQuery: if its rel_id exists in waiting, set its priority the same
+        as the waiting; otherwise, set its priority as remaining decoding time
+
+        only record and return rQs that only exist in running
+        """
+        slope_decode, intercept_decode = self.scheduler_config.info_decode
+        wait_rq_dict = {rid:prio for rid, prio in waiting_relid_cost}
         running_queries = defaultdict(list)
-        wait_rq_dict = {rid:prio for rid, prio in record_relid_cost}
+        running_rq_cost = []
+        decoding_bs = len(self.running)
         for sg in self.running:
             running_queries[sg.rel_id].append(sg)
         for rid, sgs in running_queries.items():
@@ -2413,16 +2419,13 @@ class Scheduler:
                     sg.priority = wait_rq_dict[rid]
             else:
                 # calculate new priority and update
-                decoding_bs = len(self.running)
                 leftover_num_steps = max(sg.sampling_params.max_tokens - sg.get_seqs()[0].get_output_len()
                         for sg in sgs)
                 leftover_cost = leftover_num_steps * (slope_decode * decoding_bs + intercept_decode)
                 for sg in sgs:
                     sg.priority = leftover_cost
-        """
-        
-        elapsed_time = time.perf_counter() - ts
-        logger.info(f"priority updating overhead in seconds: {elapsed_time}, relid_cost: {sorted_record}")
+                running_rq_cost.append((rid, leftover_cost))
+        sorted_record = sorted(running_rq_cost, key=lambda x:x[1])
         return sorted_record
 
     def _update_query_priority_bs(self, max_sim_steps=0):
@@ -2579,10 +2582,17 @@ class Scheduler:
                 max_num_seqs=self.scheduler_config.max_num_seqs,
             )
 
-            # Update the priority for waiting relQueries
+            # Update the priority for waiting & running relQueries
             assert len(self.scheduler_config.info_prefill) == 2
             assert len(self.scheduler_config.info_decode) == 2
+            tic = time.perf_counter()
             waiting_relid_cost = self._update_query_priority_abs()
+            if self.scheduler_config.policy in ["priority_ada_pabs", "priority_ovlp_pabs", "priority_islt_pabs"]:
+                running_relid_cost = self._update_running_priority_abs(waiting_relid_cost)
+            else:
+                running_relid_cost = []
+            elapsed_time = time.perf_counter() - tic
+            logger.info(f"priority updating overhead in seconds: {elapsed_time}, waiting_relid_cost: {waiting_relid_cost}, running_relid_cost: {running_relid_cost}")
 
             # Make sure we include num running seqs before scheduling prefill,
             # so that we don't schedule beyond max_num_seqs for prefill.
@@ -2599,6 +2609,7 @@ class Scheduler:
                 overlap_policy = self.scheduler_config.policy.split("_")[1]
                 prefills = self._schedule_prefills_ada_pabs(budget,
                         waiting_relid_cost,
+                        running_relid_cost,
                         overlap_policy,
                         curr_loras=None,
                         enable_chunking=False)

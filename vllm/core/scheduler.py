@@ -437,6 +437,9 @@ class Scheduler:
         self.historical_cache_miss = dict()
         self.historical_staleness = dict()
 
+        self.cached_waiting_priority = None
+        self.cached_waiting_queue_status = None
+
     @property
     def next_cache_id(self):
         return (self.cache_id + 1) % self.num_cache_iters
@@ -1437,6 +1440,7 @@ class Scheduler:
         # include each rid's time and check
         # for the most front rQ, its workload is changed
         new_tp = (waiting_relid_cost[0][0], whole_workload_front_rq)
+        old_tp = (waiting_relid_cost[0][0], waiting_relid_cost[0][1])
         waiting_relid_cost[0] = new_tp
 
         # for each of waiting rQ, its latency is: waiting time (offset) + execution time
@@ -1445,6 +1449,9 @@ class Scheduler:
             logger.info(f"-- rid {rid} latency: {cur_latency}")
             total_latency += cur_latency
             offset += duration
+
+        # restore waiting_relid_cost
+        waiting_relid_cost[0] = old_tp
 
         return total_latency
 
@@ -2547,6 +2554,33 @@ class Scheduler:
             all_prompt_tokens_set.update(sg.get_seqs()[0].prompt_token_ids)
         return all_prompt_tokens_set
 
+    def _construct_waiting_status(self):
+        """
+        status is a dict: rel_id ==> #reqs in that rQ
+        """
+        status = dict()
+        for sg in self.waiting:
+            if sg.rel_id not in status:
+                status[sg.rel_id] = 0
+            status[sg.rel_id] += 1
+        return status
+
+    def _maybe_update_waiting_priority_abs(self):
+        """
+        if waiting queue is not changed, return cached results to reduce overhead
+        """
+        waiting_status = self._construct_waiting_status()
+        if waiting_status != self.cached_waiting_queue_status:
+            # recompute 
+            waiting_relid_cost = self._update_query_priority_abs()
+            # update for future reuse
+            self.cached_waiting_queue_status = waiting_status
+            self.cached_waiting_priority = waiting_relid_cost
+        else:
+            logger.info("reuse waiting priority")
+
+        return self.cached_waiting_priority
+
     def _schedule_default(self) -> SchedulerOutputs:
         """Schedule queued requests.
         
@@ -2586,7 +2620,7 @@ class Scheduler:
             assert len(self.scheduler_config.info_prefill) == 2
             assert len(self.scheduler_config.info_decode) == 2
             tic = time.perf_counter()
-            waiting_relid_cost = self._update_query_priority_abs()
+            waiting_relid_cost = self._maybe_update_waiting_priority_abs()
             if self.scheduler_config.policy in ["priority_ada_pabs", "priority_ovlp_pabs", "priority_islt_pabs"]:
                 running_relid_cost = self._update_running_priority_abs(waiting_relid_cost)
             else:

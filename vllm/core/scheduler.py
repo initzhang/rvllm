@@ -1198,19 +1198,21 @@ class Scheduler:
         only_one_rel_id = False
         # ada policy will fall into either ovlp or islt before prefill loop
         tmp_overlap_policy = overlap_policy if overlap_policy in ["ovlp", "islt"] else None
-        if overlap_policy != "ovlp":
+        if overlap_policy in ["ada", "islt"]:
+            # both need to detect inter-rQ
             only_one_rel_id = True
             contained_rel_id = None
             RIDs = set(sg.rel_id for sg in self.running)
             WIDs = set(x[0] for x in waiting_relid_cost)
+            #FIXME: tailed_workloads may have longer time than waiting, thus not definitely high-prio
             tailed_workload_rids = RIDs - WIDs # leftover workload of high prio rQ
 
             is_inter = False
-            if len(self.running) and len(self.waiting) and self.running[-1].rel_id != self.waiting[0].rel_id and len(tailed_workload_rids):
+            if len(self.running) and len(self.waiting) and self.running[0].rel_id != self.waiting[0].rel_id and len(tailed_workload_rids):
                 """
                 if len(self.running) == 0: cold start
-                if len(self.waiting) == 0: leftover
-                if self.running[-1].rel_id != self.waiting[0].rel_id: intra-rQ
+                if len(self.waiting) == 0: nothing to decide, must be decode
+                if self.running[0].rel_id == self.waiting[0].rel_id: intra-rQ
                 if len(tailed_workload_rids) == 0: running rQs are all preempted ones
                 """
                 is_inter = True
@@ -1218,7 +1220,8 @@ class Scheduler:
             else:
                 logger.info(f"intra-rQ / cold start / preempt")
 
-            if is_inter:
+            # ada need to determine further action
+            if is_inter and overlap_policy == "ada":
                 """
                 first construct the next prefill batch
                 then check whether it is beneficial to execute this batch
@@ -1404,11 +1407,13 @@ class Scheduler:
         #    calc latency for each rQ
         decoding_bs = len(self.running) + len(next_prefill_batch)
         logger.info(f"anticipated decode bs: {decoding_bs}, single step time: {slope_decode * decoding_bs + intercept_decode:.5f} s")
+        max_lat = -1
         for rid, max_output_len in running_queries_leftover_length.items():
             cur_latency = offset + max_output_len * (slope_decode * decoding_bs + intercept_decode)
             logger.info(f"-- rid {rid} latency: {cur_latency}")
             total_latency += cur_latency
-            offset = max(offset, cur_latency)
+            max_lat = max(max_lat, cur_latency)
+        offset = max_lat
 
         # 3. calculate latency for each waiting query
         """
@@ -2219,11 +2224,14 @@ class Scheduler:
         logger.info(f"priority updating overhead in seconds: {elapsed_time}")
 
 
-    def _compute_cache_miss(self, sg_list):
+    def _compute_cache_miss(self, sg_list, enforce_second=False):
         """
         given a sg_list, calculate the cache miss rate
         key problem: the first batch and subsequent batches may have very different ratios
         therefore, return two floats (cache_miss_first, cache_miss_subsequent)
+
+        enforce_second: even if one prefill batch is sufficient to hold all prefill tokens,
+            we still calculate the second cache hit. used for ada PD control
         """
         if len(sg_list) == 0:
             raise ValueError
@@ -2242,14 +2250,17 @@ class Scheduler:
         first_batch_cache_miss_ratio = first_batch_uncached_tokens / (
                 first_batch_uncached_tokens + first_batch_cached_tokens)
 
-        if first_batch_uncached_tokens <= self.scheduler_config.max_num_batched_tokens:
+        if not enforce_second and first_batch_uncached_tokens <= self.scheduler_config.max_num_batched_tokens:
             # one batch is sufficient to prefill all
             return (first_batch_cache_miss_ratio, first_batch_cache_miss_ratio)
 
         if sample_size > len(sg_list) / 2:
             # to avoid next_batch has no content...
             sample_size = int(sample_size / 2)
-            assert sample_size
+            if sample_size == 0:
+                # too few samples, directly return 
+                return (first_batch_cache_miss_ratio, first_batch_cache_miss_ratio)
+            #assert sample_size
 
         # calculate subsequent_batch_cache_miss_ratio
         sampled_first_batch_token_ids_set = self._obtain_token_ids_set_from_sg_list(sg_list[:sample_size])
@@ -2269,7 +2280,7 @@ class Scheduler:
         slope_prefill, intercept_prefill = self.scheduler_config.info_prefill
         slope_decode, intercept_decode = self.scheduler_config.info_decode
 
-        first_cache_miss_ratio, subsequent_cache_miss_ratio = self._compute_cache_miss(target_sg_list)
+        first_cache_miss_ratio, subsequent_cache_miss_ratio = self._compute_cache_miss(target_sg_list, enforce_second=True)
         assert len(set(sg.rel_id for sg in target_sg_list)) == 1, "Not single relQuery"
 
         if subsequent_cache:
@@ -2322,7 +2333,7 @@ class Scheduler:
                 (b). if found historical data, reuse at most staleness_bound times
             (2) with the cache miss rate, directly derive #batches, and the cost
 
-        modification: (removed)
+        modification:
             * for each of running relQuery: if its rel_id exists in waiting, set its priority the same
             as the waiting; otherwise, set its priority as remaining decoding time
         """

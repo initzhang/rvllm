@@ -1232,11 +1232,15 @@ class Scheduler:
                         waiting_relid_cost[0][0], NFT)
                 
                 if len(mimic_prefill_batch) != 0:
-                    no_overlap_latency = self.predict_no_overlap_latency(waiting_relid_cost)
-                    overlap_latency = self.predict_with_overlap_latency(mimic_prefill_batch, waiting_relid_cost, mimic_prefill_tokens)
-                    do_overlap = overlap_latency < no_overlap_latency
+                    #no_overlap_latency = self.predict_no_overlap_latency(waiting_relid_cost)
+                    #overlap_latency = self.predict_with_overlap_latency(mimic_prefill_batch, waiting_relid_cost, mimic_prefill_tokens)
+                    #do_overlap = overlap_latency < no_overlap_latency
+                    #dur = time.perf_counter() - tic
+                    #logger.info(f"no_overlap_latency: {no_overlap_latency}, overlap_latency: {overlap_latency}, do_overlap: {do_overlap}, overhead: {dur:.5f}")
+                    delta_latency = self.predict_delta_latency(mimic_prefill_batch, waiting_relid_cost, running_relid_cost, mimic_prefill_tokens)
+                    do_overlap = delta_latency < 0
                     dur = time.perf_counter() - tic
-                    logger.info(f"no_overlap_latency: {no_overlap_latency}, overlap_latency: {overlap_latency}, do_overlap: {do_overlap}, overhead: {dur:.5f}")
+                    logger.info(f"delta_latency: {delta_latency}, do_overlap: {do_overlap}, overhead: {dur:.5f}")
                     if do_overlap:
                         tmp_overlap_policy = "ovlp"
                     else:
@@ -1371,6 +1375,61 @@ class Scheduler:
             ignored_seq_groups=ignored_seq_groups,
             num_lookahead_slots=self._get_num_lookahead_slots(
                 is_prefill=True, enable_chunking=enable_chunking))
+
+    def predict_delta_latency(self, next_prefill_batch, waiting_relid_cost, running_relid_cost, prefill_num_tokens):
+        """
+        if insert the next_prefill_batch of rQ2 before the decoding of rQ1, give the delta of latency
+        * for running high prio rQ1: latency increased by (1) prefill time (2) delta decode time
+        * for waiting low prio rQ2: latency reduced by (1) less decode iteration - delta decode time
+        * for other waiting rQ: rQ2's finish time is moved ahead by x, then Nx is reduced time
+
+        due to iterative decision, there maybe multiple rQ1
+        """
+        slope_decode, intercept_decode = self.scheduler_config.info_decode
+        slope_prefill, intercept_prefill = self.scheduler_config.info_prefill
+        # next prefill batch's time
+        prefill_batch_time = prefill_num_tokens * slope_prefill + intercept_prefill
+        logger.info(f"next prefill batch #tokens: {prefill_num_tokens}, #seqs: {len(next_prefill_batch)}, estimate time: {prefill_batch_time:.5f} s")
+        # delta decode time per step
+        delta_decode_per_step = len(next_prefill_batch) * slope_decode
+        # new added batch's decode len, subtract 1 for prefill
+        new_added_output_len = next_prefill_batch[0].sampling_params.max_tokens - 1
+        logger.info(f"delta decode per step: {delta_decode_per_step:.5f} s, new_added_output_len: {new_added_output_len}")
+
+        running_queries = defaultdict(list)
+        for sg in self.running:
+            running_queries[sg.rel_id].append(sg)
+        waiting_queries = defaultdict(list)
+        for sg in self.waiting:
+            waiting_queries[sg.rel_id].append(sg)
+
+        # increased latency of rQ1
+        increased_rQ1_latency = 0
+        record_rQ1_max_output_len = 0
+        for rid, _ in running_relid_cost:
+            # prefill incurred latency
+            increased_rQ1_latency += prefill_batch_time
+            # decode incurred latency
+            sgs = running_queries[rid]
+            max_output_len = max(sg.sampling_params.max_tokens - sg.get_seqs()[0].get_output_len() for sg in sgs)
+            record_rQ1_max_output_len = max(record_rQ1_max_output_len, max_output_len)
+            # if new is longer, then full cost, otherwise only partial cost
+            increased_rQ1_latency += delta_decode_per_step * min(new_added_output_len, max_output_len)
+            logger.info(f"rQ {rid}, max output len {max_output_len}, increased latency: {increased_rQ1_latency:.5f}")
+
+        # decreased latency of rQ2
+        # the insert of prefill batch save many steps of decoding! but the delta decode overhead must be counted
+        # rQ2_orig_decode_per_step_time = slope_decode * len(next_prefill_batch) + intercept_decode
+        # decreased_rQ2_latency += (rQ2_orig_decode_per_step_time - delta_decode_per_step) * actual saving steps
+        decreased_rQ2_latency = min(new_added_output_len, record_rQ1_max_output_len) * intercept_decode
+
+        # waiting ones
+        decreased_waiting_latency = (len(waiting_relid_cost) - 1) * decreased_rQ2_latency
+
+        logger.info(f"rQ2 & other waitings decreased latency: {decreased_rQ2_latency:.5f} & {decreased_waiting_latency:.5f}")
+
+        # if return < 0, means insert this prefill brings less latency
+        return increased_rQ1_latency - decreased_rQ2_latency - decreased_waiting_latency
 
     def predict_with_overlap_latency(self, next_prefill_batch, waiting_relid_cost, prefill_num_tokens):
         """
@@ -2303,18 +2362,20 @@ class Scheduler:
                 # subsequent batch
                 uncache_tokens = sg.get_seqs()[0].get_prompt_len() * subsequent_cache_miss_ratio
 
+            #if cur_batch_prefill_tokens + uncache_tokens > self.scheduler_config.max_num_batched_tokens:
             if cur_batch_prefill_tokens + uncache_tokens > self.scheduler_config.max_model_len:
                 # prefill cost
                 cost += cur_batch_prefill_tokens * slope_prefill + intercept_prefill
                 # decode cost
                 cost += (cur_batch_num_seqs * slope_decode + intercept_decode) * cur_batch_max_output_len
-                # reset 
+                # reset
                 cur_batch_prefill_tokens = 0
                 cur_batch_num_seqs = 0
                 cur_batch_max_output_len = 0
             # batching
             cur_batch_prefill_tokens += uncache_tokens
             cur_batch_num_seqs += 1
+            #cur_batch_max_output_len = max(cur_batch_max_output_len, sg.sampling_params.max_tokens - 1)
             cur_batch_max_output_len = max(cur_batch_max_output_len, sg.sampling_params.max_tokens)
 
         # leftover
@@ -2373,7 +2434,8 @@ class Scheduler:
                     # subsequent batch
                     uncache_tokens = sg.get_seqs()[0].get_prompt_len() * subsequent_cache_miss_ratio
 
-                if cur_batch_prefill_tokens + uncache_tokens > self.scheduler_config.max_model_len:
+                #if cur_batch_prefill_tokens + uncache_tokens > self.scheduler_config.max_model_len:
+                if cur_batch_prefill_tokens + uncache_tokens > self.scheduler_config.max_num_batched_tokens:
                     # prefill cost
                     cost += cur_batch_prefill_tokens * slope_prefill + intercept_prefill
                     # decode cost
@@ -2385,7 +2447,8 @@ class Scheduler:
                 # batching
                 cur_batch_prefill_tokens += uncache_tokens
                 cur_batch_num_seqs += 1
-                cur_batch_max_output_len = max(cur_batch_max_output_len, sg.sampling_params.max_tokens)
+                #cur_batch_max_output_len = max(cur_batch_max_output_len, sg.sampling_params.max_tokens)
+                cur_batch_max_output_len = max(cur_batch_max_output_len, sg.sampling_params.max_tokens-1)
 
             # leftover
             if cur_batch_num_seqs:

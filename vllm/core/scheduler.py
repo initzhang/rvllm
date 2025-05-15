@@ -1227,16 +1227,12 @@ class Scheduler:
                 first construct the next prefill batch
                 then check whether it is beneficial to execute this batch
                 """
+
                 tic = time.perf_counter()
                 mimic_prefill_batch, mimic_prefill_tokens = self._mimic_next_prefill_batch(budget,
                         waiting_relid_cost[0][0], NFT)
                 
                 if len(mimic_prefill_batch) != 0:
-                    #no_overlap_latency = self.predict_no_overlap_latency(waiting_relid_cost)
-                    #overlap_latency = self.predict_with_overlap_latency(mimic_prefill_batch, waiting_relid_cost, mimic_prefill_tokens)
-                    #do_overlap = overlap_latency < no_overlap_latency
-                    #dur = time.perf_counter() - tic
-                    #logger.info(f"no_overlap_latency: {no_overlap_latency}, overlap_latency: {overlap_latency}, do_overlap: {do_overlap}, overhead: {dur:.5f}")
                     delta_latency = self.predict_delta_latency(mimic_prefill_batch, waiting_relid_cost, running_relid_cost, mimic_prefill_tokens)
                     do_overlap = delta_latency < 0
                     dur = time.perf_counter() - tic
@@ -2479,7 +2475,6 @@ class Scheduler:
         wait_rq_dict = {rid:prio for rid, prio in waiting_relid_cost}
         running_queries = defaultdict(list)
         running_rq_cost = []
-        decoding_bs = len(self.running)
         for sg in self.running:
             running_queries[sg.rel_id].append(sg)
         for rid, sgs in running_queries.items():
@@ -2491,6 +2486,13 @@ class Scheduler:
                 # calculate new priority and update
                 leftover_num_steps = max(sg.sampling_params.max_tokens - sg.get_seqs()[0].get_output_len()
                         for sg in sgs)
+                """
+                if we use len(self.running) as decoding bs, the priority scale is not consistent across
+                waiting and running: in waiting, priority are calculated with assumption of isolated 
+                execution, so here we use len(sgs) as decoding bs
+                """
+                #decoding_bs = len(self.running) 
+                decoding_bs = len(sgs)
                 leftover_cost = leftover_num_steps * (slope_decode * decoding_bs + intercept_decode)
                 for sg in sgs:
                     sg.priority = leftover_cost

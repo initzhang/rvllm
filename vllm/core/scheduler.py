@@ -1156,6 +1156,15 @@ class Scheduler:
         return final_prefill_batch, cur_batch_prefill_tokens
 
 
+    def _rq_almost_done(self, target_rid):
+        for sg in self.running:
+            if sg.rel_id == target_rid:
+                remaining_steps = sg.sampling_params.max_tokens - sg.get_seqs()[0].get_output_len()
+                if remaining_steps < 10:
+                    logger.info(f"running highest rQ {target_rid} almost done (remaining steps: {remaining_steps})")
+                    return True
+        return False
+
     def _schedule_prefills_ada_pabs(
         self,
         budget: SchedulingBudget,
@@ -1205,7 +1214,7 @@ class Scheduler:
         # ada policy will fall into either ovlp or islt before prefill loop
         tmp_overlap_policy = overlap_policy if overlap_policy in ["ovlp", "islt"] else None
         if overlap_policy in ["ada", "islt"]:
-            # both need to detect inter-rQ
+            # both need to detect inter-rQ or not
             only_one_rel_id = True
             contained_rel_id = None
             is_inter = False
@@ -1224,25 +1233,29 @@ class Scheduler:
             # ada need to determine further action
             if is_inter and overlap_policy == "ada":
                 """
-                first construct the next prefill batch
-                then check whether it is beneficial to execute this batch
+                (1) if running rQ with higher prio has few decoding steps, islt
+                (2) otherwise, construct the next prefill batch, and check delta latency
                 """
-
                 tic = time.perf_counter()
-                mimic_prefill_batch, mimic_prefill_tokens = self._mimic_next_prefill_batch(budget,
-                        waiting_relid_cost[0][0], NFT)
-                
-                if len(mimic_prefill_batch) != 0:
-                    delta_latency = self.predict_delta_latency(mimic_prefill_batch, waiting_relid_cost, running_relid_cost, mimic_prefill_tokens)
-                    do_overlap = delta_latency < 0
-                    dur = time.perf_counter() - tic
-                    logger.info(f"delta_latency: {delta_latency}, do_overlap: {do_overlap}, overhead: {dur:.5f}")
-                    if do_overlap:
-                        tmp_overlap_policy = "ovlp"
+                if self._rq_almost_done(running_relid_cost[0][0]):
+                    # islt to decode since running highest prio rQ almost done
+                    delta_latency = 111
+                else:
+                    mimic_prefill_batch, mimic_prefill_tokens = self._mimic_next_prefill_batch(budget,
+                            waiting_relid_cost[0][0], NFT)
+                    if len(mimic_prefill_batch) == 0:
+                        # islt to decode since no KV cache space
+                        delta_latency = 222
                     else:
-                        tmp_overlap_policy = "islt"
+                        # check delta latency
+                        delta_latency = self.predict_delta_latency(mimic_prefill_batch, waiting_relid_cost, running_relid_cost, mimic_prefill_tokens)
+                do_overlap = delta_latency < 0
+                if do_overlap:
+                    tmp_overlap_policy = "ovlp"
                 else:
                     tmp_overlap_policy = "islt"
+                dur = time.perf_counter() - tic
+                logger.info(f"delta_latency: {delta_latency}, do_overlap: {do_overlap}, overhead: {dur:.5f}")
         ########################### new logic end
 
         ignored_seq_groups: List[SequenceGroup] = []
@@ -2382,7 +2395,7 @@ class Scheduler:
         return cost
 
 
-    def _update_query_priority_abs(self, staleness_bound=-1):
+    def _update_waiting_priority_abs(self, staleness_bound=-1):
         """
         update priority for waiting relQueries
 
@@ -2637,7 +2650,7 @@ class Scheduler:
         waiting_status = self._construct_waiting_status()
         if waiting_status != self.cached_waiting_queue_status:
             # recompute 
-            waiting_relid_cost = self._update_query_priority_abs()
+            waiting_relid_cost = self._update_waiting_priority_abs()
             # update for future reuse
             self.cached_waiting_queue_status = waiting_status
             self.cached_waiting_priority = waiting_relid_cost

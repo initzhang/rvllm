@@ -1157,6 +1157,7 @@ class Scheduler:
 
 
     def _rq_almost_done(self, target_rid):
+        return False
         for sg in self.running:
             if sg.rel_id == target_rid:
                 remaining_steps = sg.sampling_params.max_tokens - sg.get_seqs()[0].get_output_len()
@@ -2254,17 +2255,6 @@ class Scheduler:
             self.prev_prompt = True
         return out_prefills
 
-    def agg_query_dict(self):
-        running_queries = defaultdict(list)
-        waiting_queries = defaultdict(list)
-        for sg in self.running:
-            running_queries[sg.priority].append(sg)
-
-        for sg in self.waiting:
-            waiting_queries[sg.priority].append(sg)
-
-        return running_queries, waiting_queries
-
     def _update_query_priority_tc(self):
         """
         only update for the waiting queries
@@ -2343,18 +2333,18 @@ class Scheduler:
         subsequent_batch_cache_miss_ratio = max(overlap_ratio, first_batch_cache_miss_ratio)
         return (first_batch_cache_miss_ratio, subsequent_batch_cache_miss_ratio)
 
-    def _calc_single_query_priority(self, target_sg_list, subsequent_cache=False):
+    def _calc_single_query_priority(self, target_sg_list, enforce_second=False, subsequent_cache=False):
         """
         given a list, return the abs priority
         """
         if len(target_sg_list) == 0:
             return 0
+        assert len(set(sg.rel_id for sg in target_sg_list)) == 1, "Not single relQuery"
 
         slope_prefill, intercept_prefill = self.scheduler_config.info_prefill
         slope_decode, intercept_decode = self.scheduler_config.info_decode
 
-        first_cache_miss_ratio, subsequent_cache_miss_ratio = self._compute_cache_miss(target_sg_list, enforce_second=True)
-        assert len(set(sg.rel_id for sg in target_sg_list)) == 1, "Not single relQuery"
+        first_cache_miss_ratio, subsequent_cache_miss_ratio = self._compute_cache_miss(target_sg_list, enforce_second)
 
         if subsequent_cache:
             first_cache_miss_ratio = subsequent_cache_miss_ratio
@@ -2371,8 +2361,8 @@ class Scheduler:
                 # subsequent batch
                 uncache_tokens = sg.get_seqs()[0].get_prompt_len() * subsequent_cache_miss_ratio
 
-            #if cur_batch_prefill_tokens + uncache_tokens > self.scheduler_config.max_num_batched_tokens:
-            if cur_batch_prefill_tokens + uncache_tokens > self.scheduler_config.max_model_len:
+            #if cur_batch_prefill_tokens + uncache_tokens > self.scheduler_config.max_model_len:
+            if cur_batch_prefill_tokens + uncache_tokens > self.scheduler_config.max_num_batched_tokens:
                 # prefill cost
                 cost += cur_batch_prefill_tokens * slope_prefill + intercept_prefill
                 # decode cost
@@ -2384,13 +2374,13 @@ class Scheduler:
             # batching
             cur_batch_prefill_tokens += uncache_tokens
             cur_batch_num_seqs += 1
-            #cur_batch_max_output_len = max(cur_batch_max_output_len, sg.sampling_params.max_tokens - 1)
-            cur_batch_max_output_len = max(cur_batch_max_output_len, sg.sampling_params.max_tokens)
+            #cur_batch_max_output_len = max(cur_batch_max_output_len, sg.sampling_params.max_tokens)
+            cur_batch_max_output_len = max(cur_batch_max_output_len, sg.sampling_params.max_tokens - 1)
 
         # leftover
         if cur_batch_num_seqs:
             cost += cur_batch_prefill_tokens * slope_prefill + intercept_prefill
-            cost += (cur_batch_num_seqs * slope_decode + intercept_decode ) * cur_batch_max_output_len
+            cost += (cur_batch_num_seqs * slope_decode + intercept_decode) * cur_batch_max_output_len
 
         return cost
 
@@ -2643,6 +2633,48 @@ class Scheduler:
             status[sg.rel_id] += 1
         return status
 
+    def _check_reuse_update_waiting_priority_abs(self):
+        """
+        update (1) priority (2) content of self.waiting
+        """
+        agg_waiting = dict()
+        for sg in self.waiting:
+            if sg.rel_id not in agg_waiting:
+                agg_waiting[sg.rel_id] = []
+            agg_waiting[sg.rel_id].append(sg)
+        new_waiting_queue_status = {rid:len(sgs) for rid, sgs in agg_waiting.items()}
+        old_waiting_priority = {rid:cost for rid, cost in self.cached_waiting_priority} if self.cached_waiting_priority else None
+
+        reuse_count = 0
+        if new_waiting_queue_status != self.cached_waiting_queue_status:
+            # check each relid and reuse if possible
+            new_waiting_priority_dict = dict() # rid --> cost
+            for rid, sgs in agg_waiting.items():
+                if self.cached_waiting_queue_status is None or rid not in self.cached_waiting_queue_status or self.cached_waiting_queue_status[rid] != len(sgs):
+                    # recompute for new or changed rQs
+                    new_waiting_priority_dict[rid] = self._calc_single_query_priority(sgs)
+                else:
+                    # reuse
+                    reuse_count += 1
+                    new_waiting_priority_dict[rid] = old_waiting_priority[rid]
+
+            # update cache
+            self.cached_waiting_queue_status = new_waiting_queue_status
+            waiting_relid_cost = sorted(new_waiting_priority_dict.items(), key=lambda x:x[1])
+            self.cached_waiting_priority = waiting_relid_cost
+
+            # update self.waiting
+            new_waiting = []
+            for rel_id, _ in waiting_relid_cost:
+                new_waiting += agg_waiting[rel_id]
+            self.waiting = deque(new_waiting)
+            logger.info(f"reuse {reuse_count} rQs' priority out of {len(new_waiting_priority_dict)}")
+        else:
+            logger.info(f"fully reuse waiting priority")
+
+        return self.cached_waiting_priority
+        
+
     def _maybe_update_waiting_priority_abs(self):
         """
         if waiting queue is not changed, return cached results to reduce overhead
@@ -2698,8 +2730,9 @@ class Scheduler:
             assert len(self.scheduler_config.info_prefill) == 2
             assert len(self.scheduler_config.info_decode) == 2
             tic = time.perf_counter()
-            waiting_relid_cost = self._maybe_update_waiting_priority_abs()
-            if self.scheduler_config.policy in ["priority_ada_pabs", "priority_ovlp_pabs", "priority_islt_pabs"]:
+            #waiting_relid_cost = self._maybe_update_waiting_priority_abs()
+            waiting_relid_cost = self._check_reuse_update_waiting_priority_abs()
+            if self.scheduler_config.policy in ["priority_ada_pabs", "priority_islt_pabs"]:
                 running_relid_cost = self._update_running_priority_abs(waiting_relid_cost)
             else:
                 running_relid_cost = []

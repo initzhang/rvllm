@@ -1157,7 +1157,6 @@ class Scheduler:
 
 
     def _rq_almost_done(self, target_rid):
-        return False
         for sg in self.running:
             if sg.rel_id == target_rid:
                 remaining_steps = sg.sampling_params.max_tokens - sg.get_seqs()[0].get_output_len()

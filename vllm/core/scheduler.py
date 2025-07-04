@@ -2312,7 +2312,9 @@ class Scheduler:
         first_batch_cache_miss_ratio = first_batch_uncached_tokens / (
                 first_batch_uncached_tokens + first_batch_cached_tokens)
 
-        if not enforce_second and first_batch_uncached_tokens <= self.scheduler_config.max_num_batched_tokens:
+        return (first_batch_cache_miss_ratio, first_batch_cache_miss_ratio)
+        estimated_total_prefill_tokens = first_batch_uncached_tokens * len(sg) / sample_size if sample_size > 10 else first_batch_uncached_tokens
+        if not enforce_second and estimated_total_prefill_tokens <= self.scheduler_config.max_num_batched_tokens:
             # one batch is sufficient to prefill all
             return (first_batch_cache_miss_ratio, first_batch_cache_miss_ratio)
 
@@ -2344,6 +2346,7 @@ class Scheduler:
         slope_decode, intercept_decode = self.scheduler_config.info_decode
 
         first_cache_miss_ratio, subsequent_cache_miss_ratio = self._compute_cache_miss(target_sg_list, enforce_second)
+        #logger.info(f"rid: {target_sg_list[0].rel_id}, first/subsequent cache miss_ratio: {first_cache_miss_ratio:.2f} / {subsequent_cache_miss_ratio:.2f}")
 
         if subsequent_cache:
             first_cache_miss_ratio = subsequent_cache_miss_ratio

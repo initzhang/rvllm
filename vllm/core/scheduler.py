@@ -2334,6 +2334,67 @@ class Scheduler:
         subsequent_batch_cache_miss_ratio = max(overlap_ratio, first_batch_cache_miss_ratio)
         return (first_batch_cache_miss_ratio, subsequent_batch_cache_miss_ratio)
 
+    def _calc_single_query_priority_cd(self, target_sg_list, enforce_second=False, subsequent_cache=False):
+        """
+        given a list, return the abs priority
+        combined decode version, similar performance compared to no _cd version
+        """
+        if len(target_sg_list) == 0:
+            return 0
+        assert len(set(sg.rel_id for sg in target_sg_list)) == 1, "Not single relQuery"
+        assert not enforce_second
+        assert not subsequent_cache
+
+        slope_prefill, intercept_prefill = self.scheduler_config.info_prefill
+        slope_decode, intercept_decode = self.scheduler_config.info_decode
+
+        first_cache_miss_ratio, _ = self._compute_cache_miss(target_sg_list, enforce_second)
+
+        cap_gpu_kv_tokens = self.block_manager.num_total_gpu_blocks * self.block_manager.block_size
+
+        """
+        multiple prefill batch forms one decode batch
+        """
+        cost = 0
+        cur_prefill_batch_tokens = 0
+        accum_prefill_tokens = 0
+        cur_decode_batch_seqs = 0
+        output_len = target_sg_list[0].sampling_params.max_tokens - 1
+        for sg in target_sg_list:
+            uncache_tokens = sg.get_seqs()[0].get_prompt_len() * first_cache_miss_ratio
+
+            if accum_prefill_tokens + uncache_tokens > cap_gpu_kv_tokens:
+                """
+                GPU space is full, need to flush:
+                    * execute current prefill batch
+                    * execute decode batches for previously prefilled requests 
+                """
+                cost += cur_prefill_batch_tokens * slope_prefill + intercept_prefill
+                cost += (cur_decode_batch_seqs * slope_decode + intercept_decode) * output_len
+                # reset 
+                cur_prefill_batch_tokens = 0
+                cur_decode_batch_seqs = 0
+                accum_prefill_tokens = 0
+
+            # insert request into GPU space
+            if cur_prefill_batch_tokens + uncache_tokens > self.scheduler_config.max_num_batched_tokens:
+                # prefill batch full, execute one prefill batch
+                cost += cur_prefill_batch_tokens * slope_prefill + intercept_prefill
+                # reset
+                cur_prefill_batch_tokens = 0
+
+            cur_prefill_batch_tokens += uncache_tokens
+            accum_prefill_tokens += uncache_tokens
+            cur_decode_batch_seqs += 1
+
+        # leftover
+        if cur_decode_batch_seqs:
+            cost += cur_prefill_batch_tokens * slope_prefill + intercept_prefill
+            cost += (cur_decode_batch_seqs * slope_decode + intercept_decode) * output_len
+
+        return cost
+
+
     def _calc_single_query_priority(self, target_sg_list, enforce_second=False, subsequent_cache=False):
         """
         given a list, return the abs priority
@@ -2655,6 +2716,7 @@ class Scheduler:
                 if self.cached_waiting_queue_status is None or rid not in self.cached_waiting_queue_status or self.cached_waiting_queue_status[rid] != len(sgs):
                     # recompute for new or changed rQs
                     new_waiting_priority_dict[rid] = self._calc_single_query_priority(sgs)
+                    #new_waiting_priority_dict[rid] = self._calc_single_query_priority_cd(sgs)
                 else:
                     # reuse
                     reuse_count += 1

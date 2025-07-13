@@ -1409,6 +1409,8 @@ class SchedulerConfig:
     info_prefill: tuple = ()
     info_decode: tuple = ()
 
+    starvation: float = 5.0
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

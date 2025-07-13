@@ -440,6 +440,8 @@ class Scheduler:
         self.cached_waiting_priority = None
         self.cached_waiting_queue_status = None
 
+        self.starvation_threshold = dict() # rid --> threshold
+
     @property
     def next_cache_id(self):
         return (self.cache_id + 1) % self.num_cache_iters
@@ -2696,6 +2698,47 @@ class Scheduler:
             status[sg.rel_id] += 1
         return status
 
+    def _starvation_prevention(self, original_waiting_relid_cost):
+        """
+        (1) update starvation threshold for new arrival relquery
+        (2) check threshold and reset priority
+        """
+        agg_waiting = dict()
+        for sg in self.waiting:
+            if sg.rel_id not in agg_waiting:
+                agg_waiting[sg.rel_id] = []
+            agg_waiting[sg.rel_id].append(sg)
+
+        for rid, sgs in agg_waiting.items():
+            if rid not in self.starvation_threshold:
+                # first arrival, calculate threshold
+                self.starvation_threshold[rid] = self.scheduler_config.starvation * len(sgs)
+
+        starvation_count = 0
+        old_waiting_priority_dict = {rid:cost for rid, cost in original_waiting_relid_cost}
+        new_waiting_priority_dict = dict() # rid --> (cost, arrival_timestamp)
+        for rid, sgs in agg_waiting.items():
+            max_waiting_time = self.starvation_threshold[rid]
+            current_waiting_time = time.time() - sg.arrival_time
+            current_priority = old_waiting_priority_dict[rid]
+            if current_waiting_time > max_waiting_time:
+                # set priority as 0 to avoid starvation
+                starvation_count += 1
+                current_priority = 0
+                logger.info(f"starvation of rid={rid}: max_waiting={max_waiting_time} s, current waiting={current_waiting_time} s")
+            new_waiting_priority_dict[rid] = (current_priority, sg.arrival_time)
+
+        logger.info(f"Total starvation count: {starvation_count}")
+
+        # update self.waiting and record
+        tmp_data = sorted(new_waiting_priority_dict.items(), key=lambda x:x[1])
+        rectified_waiting_relid_cost = [(x[0], x[1][0]) for x in tmp_data]
+        new_waiting = []
+        for rel_id, _ in tmp_data:
+            new_waiting += agg_waiting[rel_id]
+        self.waiting = deque(new_waiting)
+        return rectified_waiting_relid_cost
+
     def _check_reuse_update_waiting_priority_abs(self):
         """
         update (1) priority (2) content of self.waiting
@@ -2800,6 +2843,9 @@ class Scheduler:
                 running_relid_cost = self._update_running_priority_abs(waiting_relid_cost)
             else:
                 running_relid_cost = []
+            if self.scheduler_config.policy in ["priority_ada_pabs"]:
+                # avoid starvation
+                waiting_relid_cost = self._starvation_prevention(waiting_relid_cost)
             elapsed_time = time.perf_counter() - tic
             logger.info(f"priority updating overhead in seconds: {elapsed_time}, waiting_relid_cost: {waiting_relid_cost}, running_relid_cost: {running_relid_cost}")
 

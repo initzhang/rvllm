@@ -200,8 +200,10 @@ class EngineArgs:
 
     generation_config: Optional[str] = None
 
-    info_prefill: Tuple[int, int] = ()
-    info_decode: Tuple[int, int] = ()
+    info_prefill: Tuple[float, float] = ()
+    info_decode: Tuple[float, float] = ()
+
+    starvation: float = 5.0
 
     def __post_init__(self):
         if not self.tokenizer:
@@ -976,6 +978,12 @@ class EngineArgs:
             default=[],
             help="slope and intercept of decode engine step execution time w.r.t. #tokens")
 
+        parser.add_argument(
+            '--starvation',
+            type=float,
+            default=5.0,
+            help="maximal waiting time (in second) per request for a relquery")
+
         return parser
 
     @classmethod
@@ -1221,7 +1229,9 @@ class EngineArgs:
                              and parallel_config.use_ray),
             policy=self.scheduling_policy,
             info_prefill=tuple(self.info_prefill),
-            info_decode=tuple(self.info_decode))
+            info_decode=tuple(self.info_decode),
+            starvation=self.starvation
+            )
         lora_config = LoRAConfig(
             bias_enabled=self.enable_lora_bias,
             max_lora_rank=self.max_lora_rank,

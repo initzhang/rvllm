@@ -203,7 +203,7 @@ class EngineArgs:
     info_prefill: Tuple[float, float] = ()
     info_decode: Tuple[float, float] = ()
 
-    starvation: float = 5.0
+    starvation: float = 10.0
 
     def __post_init__(self):
         if not self.tokenizer:
@@ -981,7 +981,7 @@ class EngineArgs:
         parser.add_argument(
             '--starvation',
             type=float,
-            default=5.0,
+            default=10.0,
             help="maximal waiting time (in second) per request for a relquery")
 
         return parser

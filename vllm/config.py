@@ -1409,7 +1409,7 @@ class SchedulerConfig:
     info_prefill: tuple = ()
     info_decode: tuple = ()
 
-    starvation: float = 5.0
+    starvation: float = 10.0
 
     def compute_hash(self) -> str:
         """

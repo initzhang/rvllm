@@ -441,6 +441,7 @@ class Scheduler:
         self.cached_waiting_queue_status = None
 
         self.starvation_threshold = dict() # rid --> threshold
+        self.relquery_arrival = dict() # rid --> first request arrival time
 
     @property
     def next_cache_id(self):
@@ -2711,22 +2712,24 @@ class Scheduler:
 
         for rid, sgs in agg_waiting.items():
             if rid not in self.starvation_threshold:
-                # first arrival, calculate threshold
+                # first arrival, calculate threshold and record arrival
                 self.starvation_threshold[rid] = self.scheduler_config.starvation * len(sgs)
+                self.relquery_arrival[rid] = min(sg.arrival_time for sg in sgs)
 
         starvation_count = 0
         old_waiting_priority_dict = {rid:cost for rid, cost in original_waiting_relid_cost}
         new_waiting_priority_dict = dict() # rid --> (cost, arrival_timestamp)
         for rid, sgs in agg_waiting.items():
             max_waiting_time = self.starvation_threshold[rid]
-            current_waiting_time = time.time() - sg.arrival_time
+            arrival_ts = self.relquery_arrival[rid]
+            current_waiting_time = time.time() - arrival_ts
             current_priority = old_waiting_priority_dict[rid]
             if current_waiting_time > max_waiting_time:
                 # set priority as 0 to avoid starvation
                 starvation_count += 1
                 current_priority = 0
                 logger.info(f"starvation of rid={rid}: max_waiting={max_waiting_time} s, current waiting={current_waiting_time} s")
-            new_waiting_priority_dict[rid] = (current_priority, sg.arrival_time)
+            new_waiting_priority_dict[rid] = (current_priority, arrival_ts)
 
         logger.info(f"Total starvation count: {starvation_count}")
 

@@ -868,7 +868,7 @@ class Scheduler:
         force_preemption_count = 0
 
         if waiting_queue:
-            #print(f"%%%xzhanggb%%%, have waiting queue")
+            #print(f"%%%xxxxxx%%%, have waiting queue")
             seq_group = waiting_queue.popleft()
             num_new_seqs = seq_group.get_max_num_running_seqs()
             num_new_tokens_uncached, _ = (
@@ -879,7 +879,7 @@ class Scheduler:
             while running_queue and self._get_priority(
                     running_queue[-1]) > self._get_priority(seq_group):
                 #Only preempt if waiting sequence cannot be allocated
-                #print(f"%%%xzhanggb%%%, inversion!!!")
+                #print(f"%%%xxxxxx%%%, inversion!!!")
                 can_allocate = self.block_manager.can_allocate(seq_group)
                 if (num_new_tokens_uncached > 0
                         and can_allocate == AllocStatus.OK
@@ -887,7 +887,7 @@ class Scheduler:
                             num_new_tokens=num_new_tokens_uncached,
                             num_new_seqs=num_new_seqs,
                         )):
-                    #print(f"%%%xzhanggb%%%, inversion break")
+                    #print(f"%%%xxxxxx%%%, inversion break")
                     break
 
                 #Adjust budget to remove the victim sequence group
@@ -2814,7 +2814,7 @@ class Scheduler:
         if self.scheduler_config.policy in ['fcfs', 'priority']:
             return self._schedule_default_old()
 
-        logger.info("%"*30+"xzhanggb"+"%"*30)
+        logger.info("%"*30+"xxxxxx"+"%"*30)
         assert self.scheduler_config.policy in ['priority_tc', 'priority_bs', 'priority_abs', 'priority_pabs', 
                 'priority_ipabs', 'priority_iso_pabs', 'priority_ada_pabs', 'priority_islt_pabs', 'priority_ovlp_pabs']
         assert not self.lora_enabled

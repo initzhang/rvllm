@@ -102,13 +102,35 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
-              bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        weight = layer.weight
-        if self.separate_bias_add:
+              bias: Optional[torch.Tensor] = None, 
+              q_only: bool = False, 
+              kv_only: bool = False) -> torch.Tensor:
+        if not q_only and not kv_only:
+            weight = layer.weight
+            if self.separate_bias_add:
+                if bias is not None:
+                    return F.linear(x, weight) + bias
+                return F.linear(x, weight)
+            return F.linear(x, weight, bias)
+        if q_only and not kv_only: #return all query first
+            slice_ = int(layer.weight.shape[0]/3)
+            w_q = layer.weight[:slice_]
             if bias is not None:
-                return F.linear(x, weight) + bias
-            return F.linear(x, weight)
-        return F.linear(x, weight, bias)
+                bias_q = bias[:slice_]
+            else:
+                bias_q = bias
+            return F.linear(x, w_q, bias_q)
+        if not q_only and kv_only: #parallel kv mapping.
+            slice_ = int(layer.weight.shape[0]/3)
+            w_kv = layer.weight[slice_:]
+            if bias is not None:
+                bias_kv = bias[slice_:]
+            else:
+                bias_kv = bias
+            return F.linear(x, w_kv, bias_kv)
+        if q_only and kv_only:
+            raise NotImplementedError
+            
 
 
 class LinearBase(torch.nn.Module):
@@ -290,12 +312,13 @@ class ColumnParallelLinear(LinearBase):
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, q_only=False, kv_only=False):
         bias = self.bias if not self.skip_bias_add else None
-
+        
         # Matrix multiply.
         assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        #default self.quant_method: UnquantizedLinearMethod
+        output_parallel = self.quant_method.apply(self, input_, bias, q_only=q_only, kv_only=kv_only)
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)

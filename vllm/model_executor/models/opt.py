@@ -40,6 +40,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
+#new here.
+import mixed_cache_ops
 
 
 class OPTLearnedPositionalEmbedding(nn.Embedding):
@@ -98,13 +100,39 @@ class OPTAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
+        shared_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.chunk(chunks=3, dim=-1)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        if attn_metadata.num_hidden_cache_tokens != 0: #req(s) requring hidden_cache exist(s).
+            #hidden_emb to hidden cache.
+            mixed_cache_ops.hidden_to_cache(hidden_states, kv_cache, attn_metadata.slot_mapping,\
+            attn_metadata.hidden_cache_use_input, attn_metadata.hidden_cache_store_tot)
+            
+            if attn_metadata.num_decode_tokens != 0: #decode
+                hidden_holder = torch.zeros(\
+                                attn_metadata.num_tot_tokens, hidden_states.shape[1],\
+                                device=hidden_states.device, dtype=hidden_states.dtype)
+                #q_only projection.
+                q, _ = self.qkv_proj(hidden_states, q_only=True, kv_only=False)
+                #fill in the latest hidden embs.
+                hidden_holder[attn_metadata.hidden_holder_upd] = hidden_states
+                #pull the past hidden embeddings from the cache.
+                mixed_cache_ops.cache_to_hidden(hidden_holder, kv_cache, attn_metadata.slot_mapping, \
+                                                attn_metadata.hidden_cache_use_tot)
+                #parallel kv projection.
+                kv, _ = self.qkv_proj(hidden_holder, q_only=False, kv_only=True)
+                k,v = kv.chunk(chunks=2, dim=-1)
+            else: #prefill
+                qkv, _ = self.qkv_proj(hidden_states)
+                q, k, v = qkv.chunk(chunks=3, dim=-1)
+        else: #no requests requiring hidden cache.
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.chunk(chunks=3, dim=-1)
+            
+        attn_output = self.attn(q, k, v, kv_cache, shared_cache, attn_metadata)
         output, _ = self.out_proj(attn_output)
         return output
+        
 
 
 class OPTDecoderLayer(nn.Module):
@@ -152,6 +180,7 @@ class OPTDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
+        shared_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         # Self Attention
@@ -161,6 +190,7 @@ class OPTDecoderLayer(nn.Module):
             hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states=hidden_states,
                                        kv_cache=kv_cache,
+                                       shared_cache=shared_cache,
                                        attn_metadata=attn_metadata)
         hidden_states = residual + hidden_states
         # 350m applies layer norm AFTER attention
@@ -242,6 +272,7 @@ class OPTDecoder(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
+        shared_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         inputs_embeds = self.embed_tokens(input_ids)
@@ -252,7 +283,7 @@ class OPTDecoder(nn.Module):
 
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states = layer(hidden_states, kv_caches[i], attn_metadata)
+            hidden_states = layer(hidden_states, kv_caches[i], shared_cache, attn_metadata)
 
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)
@@ -277,9 +308,10 @@ class OPTModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
+        shared_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        return self.decoder(input_ids, positions, kv_caches, attn_metadata)
+        return self.decoder(input_ids, positions, kv_caches, shared_cache, attn_metadata)
 
 
 class OPTForCausalLM(nn.Module):
@@ -303,9 +335,10 @@ class OPTForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
+        shared_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, kv_caches,
+        hidden_states = self.model(input_ids, positions, kv_caches, shared_cache,
                                    attn_metadata)
         return hidden_states
 

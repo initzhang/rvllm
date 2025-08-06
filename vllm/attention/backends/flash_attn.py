@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 import torch
 from vllm_flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
+import mixed_cache_ops
+
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata)
@@ -141,7 +143,25 @@ class FlashAttentionMetadata(AttentionMetadata):
             num_prefills=self.num_prefills,
             num_prefill_tokens=self.num_prefill_tokens,
             num_decode_tokens=0,
+            #num_hidden_cache_tokens
+            num_hidden_cache_tokens=self.num_hidden_cache_tokens,
+            #num_tot_tokens
+            num_tot_tokens = self.num_tot_tokens,
             slot_mapping=self.slot_mapping[:self.num_prefill_tokens],
+            #slot_mapping_shared
+            slot_mapping_shared=self.slot_mapping_shared,
+            #kv_cache_use_tot
+            kv_cache_use_tot=self.kv_cache_use_tot,
+            #hidden_cache_use_tot
+            hidden_cache_use_tot=self.hidden_cache_use_tot,
+            #hidden_cache_use_input
+            hidden_cache_use_input=self.hidden_cache_use_input,
+            #hidden_cache_store_tot
+            hidden_cache_store_tot=self.hidden_cache_store_tot,
+            #hidden_holder_upd
+            hidden_holder_upd=self.hidden_holder_upd,
+            #hidden_holder_pull
+            hidden_holder_pull=self.hidden_holder_pull,
             seq_lens=self.seq_lens[:self.num_prefills],
             seq_lens_tensor=self.seq_lens_tensor[:self.num_prefills],
             max_query_len=self.max_query_len,
@@ -169,7 +189,25 @@ class FlashAttentionMetadata(AttentionMetadata):
             num_prefills=0,
             num_prefill_tokens=0,
             num_decode_tokens=self.num_decode_tokens,
+            #num_hidden_cache_tokens
+            num_hidden_cache_tokens=self.num_hidden_cache_tokens,
+            #num_tot_tokens
+            num_tot_tokens = self.num_tot_tokens,
             slot_mapping=self.slot_mapping[self.num_prefill_tokens:],
+            #slot_mapping_shared
+            slot_mapping_shared=self.slot_mapping_shared,
+            #kv_cache_use_tot
+            kv_cache_use_tot=self.kv_cache_use_tot,
+            #hidden_cache_use_tot
+            hidden_cache_use_tot=self.hidden_cache_use_tot,
+            #hidden_cache_use_input
+            hidden_cache_use_input=self.hidden_cache_use_input,
+            #hidden_cache_store_tot
+            hidden_cache_store_tot=self.hidden_cache_store_tot,
+            #hidden_holder_upd
+            hidden_holder_upd=self.hidden_holder_upd,
+            #hidden_holder_pull
+            hidden_holder_pull=self.hidden_holder_pull,
             seq_lens=None,
             seq_lens_tensor=self.seq_lens_tensor[self.num_prefills:],
             max_query_len=None,
@@ -255,6 +293,7 @@ class FlashAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
+        shared_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
         kv_scale: float = 1.0,
     ) -> torch.Tensor:
@@ -277,28 +316,78 @@ class FlashAttentionImpl(AttentionImpl):
         query = query.view(-1, self.num_heads, self.head_size)
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
-
+                
+        
+        num_hidden_cache_tokens = attn_metadata.num_hidden_cache_tokens
+        num_prefill_tokens = attn_metadata.num_prefill_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        num_tot_tokens = attn_metadata.num_tot_tokens
+        
+        if num_hidden_cache_tokens == 0:
+            assert key.shape[0] == num_prefill_tokens + num_decode_tokens
+            assert value.shape[0] == num_prefill_tokens + num_decode_tokens
+        
+        
         if kv_cache is not None:
             key_cache = kv_cache[0]
             value_cache = kv_cache[1]
-
-            # Reshape the input keys and values and store them in the cache.
-            # If kv_cache is not provided, the new key and value tensors are
-            # not cached. This happens during the initial memory profiling run.
-            ops.reshape_and_cache_flash(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping.flatten(),
-                self.kv_cache_dtype,
-            )
-
-        num_prefill_tokens = attn_metadata.num_prefill_tokens
-        num_decode_tokens = attn_metadata.num_decode_tokens
-        assert key.shape[0] == num_prefill_tokens + num_decode_tokens
-        assert value.shape[0] == num_prefill_tokens + num_decode_tokens
-
+            if num_hidden_cache_tokens == 0:
+                # Reshape the input keys and values and store them in the cache.
+                # If kv_cache is not provided, the new key and value tensors are
+                # not cached. This happens during the initial memory profiling run.
+                ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                )
+            else: #there exists requests requring hidden cache.
+                if num_prefill_tokens != 0: #prefill.
+                    ops.reshape_and_cache_flash(
+                    key[attn_metadata.kv_cache_use_tot],
+                    value[attn_metadata.kv_cache_use_tot],
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping[attn_metadata.kv_cache_use_tot],
+                    self.kv_cache_dtype,
+                    )
+                else: #decode
+                    shared_key_cache = shared_cache[0]
+                    shared_value_cache = shared_cache[1]
+                    if num_tot_tokens != len(attn_metadata.slot_mapping_shared): 
+                        #print('start mixed kv to cache during decode.')
+                        #requests with hidden cache & kv cache 
+                        #customized kernel for writing to two different cache.
+                        mixed_cache_ops.mixed_kv_to_cache(
+                            key, 
+                            value, 
+                            key_cache, 
+                            value_cache, 
+                            shared_key_cache, 
+                            shared_value_cache, 
+                            attn_metadata.slot_mapping, 
+                            attn_metadata.slot_mapping_shared, 
+                            attn_metadata.kv_cache_use_tot,
+                            attn_metadata.hidden_cache_use_tot)
+                        #torch.cuda.synchronize()
+                        #print('finish mixed kv to cache during decode.')
+                    else: #all decode requests require hidden cache. Write to the shared cache only.
+                        #print('start tempo kv to cache during decode.')
+                        ops.reshape_and_cache_flash(
+                        key,
+                        value,
+                        shared_key_cache,
+                        shared_value_cache,
+                        attn_metadata.slot_mapping_shared,
+                        self.kv_cache_dtype,
+                        )
+                        #torch.cuda.synchronize()
+                        #print('finish tempo kv to cache during decode.')
+                        
+        
+        
         output = torch.empty_like(query)
         # Query for decode. KV is not needed because it is already cached.
         decode_query = query[num_prefill_tokens:]
@@ -306,6 +395,9 @@ class FlashAttentionImpl(AttentionImpl):
         query = query[:num_prefill_tokens]
         key = key[:num_prefill_tokens]
         value = value[:num_prefill_tokens]
+        #print('query.shape after update',query.shape)
+        #print('key.shape after update', key.shape)
+        #print('value.shape after update', value.shape)
 
         assert query.shape[0] == num_prefill_tokens
         assert decode_query.shape[0] == num_decode_tokens
@@ -314,6 +406,8 @@ class FlashAttentionImpl(AttentionImpl):
             # Prompt run.
             if (kv_cache is None or prefill_meta.block_tables is None
                     or prefill_meta.block_tables.numel() == 0):
+                #print('start flash_attn kernel.')
+                #torch.cuda.synchronize()
                 # normal attention
                 # When block_tables are not filled, it means q and k are the
                 # prompt, and they have the same length.
@@ -331,7 +425,9 @@ class FlashAttentionImpl(AttentionImpl):
                     alibi_slopes=self.alibi_slopes,
                 )
                 assert output[:num_prefill_tokens].shape == out.shape
+                #print('finish flash_attn kernel.')
                 output[:num_prefill_tokens] = out
+                #torch.cuda.synchronize()
             else:
                 # prefix-enabled attention
                 assert prefill_meta.seq_lens is not None
@@ -352,16 +448,31 @@ class FlashAttentionImpl(AttentionImpl):
 
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
-            output[num_prefill_tokens:] = flash_attn_with_kvcache(
-                decode_query.unsqueeze(1),
-                key_cache,
-                value_cache,
-                block_table=decode_meta.block_tables,
-                cache_seqlens=decode_meta.seq_lens_tensor,
-                softmax_scale=self.scale,
-                causal=True,
-                alibi_slopes=self.alibi_slopes,
-            ).squeeze(1)
+            if num_hidden_cache_tokens == 0: #all kv cache.
+                output[num_prefill_tokens:] = flash_attn_with_kvcache(
+                    decode_query.unsqueeze(1),
+                    key_cache,
+                    value_cache,
+                    block_table=decode_meta.block_tables,
+                    cache_seqlens=decode_meta.seq_lens_tensor,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                ).squeeze(1)
+            else: #hidden cache required.
+                #print('start to decode with paged attention.')
+                output[num_prefill_tokens:] = flash_attn_with_kvcache(
+                    decode_query.unsqueeze(1),
+                    shared_key_cache,
+                    shared_value_cache,
+                    block_table=decode_meta.block_tables,
+                    cache_seqlens=decode_meta.seq_lens_tensor,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                ).squeeze(1)
+                #torch.cuda.synchronize()
+                #print('finish decode with paged attention.')
 
         # Reshape the output tensor.
         return output.view(num_tokens, hidden_size)

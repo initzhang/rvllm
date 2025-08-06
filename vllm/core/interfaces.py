@@ -19,6 +19,7 @@ class AllocStatus(enum.Enum):
     OK = enum.auto()
     LATER = enum.auto()
     NEVER = enum.auto()
+    OK_HIDDEN = enum.auto()
 
 
 class BlockSpaceManager(ABC):

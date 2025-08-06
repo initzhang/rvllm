@@ -256,6 +256,8 @@ class ModelRunner:
         input_tokens: List[int] = []
         input_positions: List[int] = []
         slot_mapping: List[int] = []
+        #new_map here.
+        slot_mapping_shared: List[int] = []
         lora_index_mapping: List[int] = []
         lora_prompt_mapping: List[int] = []
         lora_requests: Set[LoRARequest] = set()
@@ -266,12 +268,16 @@ class ModelRunner:
         context_lens: List[int] = []
         query_lens: List[int] = []
         block_tables: List[List[int]] = []
+        #new here.
+        #block_tables_4_hidden_pull: List[int] = []
         multi_modal_kwargs_list: Dict[str,
                                       List[torch.Tensor]] = defaultdict(list)
         decode_only = True
+        #contain_hidden_req = False
         num_prefills = 0
         num_prefill_tokens = 0
         num_decode_tokens = 0
+        num_tot_tokens = 0
 
         # The following fields are only for flashinfer
         # Please follow https://docs.flashinfer.ai/tutorials/kv_layout.html#page-layout
@@ -290,7 +296,14 @@ class ModelRunner:
         paged_kv_indptr: List[int] = [0]
         # paged_kv_last_page_len is the length of the last page of each request
         paged_kv_last_page_len: List[int] = []
+            
+        #add the hidden embs related lists here.
+        hidden_cache_use_tot: List[int] = []
+        hidden_cache_use_input: List[int] = []
+        hidden_holder_upd: List[int] = []
+        
 
+        #print('self.attn_backend',self.attn_backend)
         if len(seq_group_metadata_list) == 0:
             return ModelInput.empty(self.device)
 
@@ -302,7 +315,14 @@ class ModelRunner:
 
         for seq_group_metadata in seq_group_metadata_list:
             seq_ids = list(seq_group_metadata.seq_data.keys())
+            
             is_prompt = seq_group_metadata.is_prompt
+            #add the flag here.
+            use_hidden = seq_group_metadata.use_hidden
+#             if not contain_hidden_req: 
+#                 if use_hidden:
+#                     contain_hidden_req = True
+            ########
 
             for seq_id in seq_ids:
                 computed_block_nums = seq_group_metadata.computed_block_nums
@@ -384,13 +404,18 @@ class ModelRunner:
                         # TODO(woosuk): This is a temporary fix. We should
                         # provide a unified interface for different backends.
                         block_table = seq_group_metadata.block_tables[seq_id]
+                        
                     else:
                         block_table = computed_block_nums
                 elif (self.scheduler_config.chunked_prefill_enabled
                       or not is_prompt):
                     if seq_group_metadata.block_tables is not None:
                         # chunked prefill or decode
-                        block_table = seq_group_metadata.block_tables[seq_id]
+                        # this is a hack for decoding over the shared paged cache.
+                        if use_hidden:
+                            block_table = seq_group_metadata.block_tables_4_shared[seq_id]
+                        if not use_hidden:
+                            block_table = seq_group_metadata.block_tables[seq_id]
                         if curr_sliding_window_blocks is not None:
                             block_table = block_table[
                                 -curr_sliding_window_blocks:]
@@ -410,6 +435,8 @@ class ModelRunner:
                     # Prefill without chunked prefill or memory profiling.
                     block_table = []
                 block_tables.append(block_table)
+                #Note that the 'block_tables' is actually for the pagedattention over the 
+                #shared cache.
 
                 seq_lens.append(sliding_seq_len)
                 context_lens.append(sliding_context_len)
@@ -418,14 +445,18 @@ class ModelRunner:
                 input_tokens.extend(tokens)
                 input_positions.extend(list(range(context_len, seq_len)))
                 lora_id = seq_group_metadata.lora_int_id
-
+                
                 if is_prompt:
+                    #if use_hidden:
+                    #    print('seq_id {} conducts prefill.'.format(seq_id))
                     assert len(seq_ids) == 1
                     num_prefills += 1
                     num_prefill_tokens += len(tokens)
                     decode_only = False
                     prefill_seq_lens.append(seq_len)
                 else:
+                    #if use_hidden:
+                    #    print('seq_id {} conducts decode.'.format(seq_id))
                     assert query_len == 1, (
                         "seq_len: {}, context_len: {}, query_len: {}".format(
                             seq_len, context_len, query_len))
@@ -462,8 +493,6 @@ class ModelRunner:
                     slot_mapping.extend([_PAD_SLOT_ID] * seq_len)
                     continue
 
-                # Compute the slot mapping.
-                block_table = seq_group_metadata.block_tables[seq_id]
 
                 # Mask the [0, start_idx) tokens of the prompt with
                 # _PAD_SLOT_ID, where start_idx is max(0, seq_len -
@@ -482,16 +511,58 @@ class ModelRunner:
                     # 0. When prefill, we use it to not write slots to kv cache
                     # to save memory.
                     start_idx = max(0, query_len - self.sliding_window)
-
+                
+                # Compute the slot mapping.
+                block_table = seq_group_metadata.block_tables[seq_id]
+                #this is new here.
+                block_table_4_shared = seq_group_metadata.block_tables_4_shared[seq_id]
+                
                 for i in range(context_len, seq_len):
                     if i < start_idx:
                         slot_mapping.append(_PAD_SLOT_ID)
-                        continue
-
-                    block_number = block_table[i // self.block_size]
-                    block_offset = i % self.block_size
-                    slot = block_number * self.block_size + block_offset
-                    slot_mapping.append(slot)
+                        continue                                
+                    if use_hidden: #request with hidden cache required.
+                        hidden_cache_use_input.append(True) 
+                        if not is_prompt: #decode
+                            num_tot_tokens += seq_len
+                            hidden_cache_use_tot.extend([True]*seq_len)
+                            hidden_holder_upd.extend([False]*(seq_len-1)+[True])
+                            for j in range(0, seq_len):
+                                #this is to write the temporary kv embeddings into the shared cache.
+                                block_number = block_table_4_shared[j // self.block_size]
+                                block_offset = j % self.block_size
+                                slot = block_number * self.block_size + block_offset
+                                slot_mapping_shared.append(slot)
+                                block_number = block_table[j // self.block_size]
+                                block_offset = j % self.block_size
+                                slot = block_number * self.block_size + block_offset
+                                slot_mapping.append(slot)
+                                
+                                
+                        else: #prefill for requests with hidden cache required.
+                            #****IMPORTANT****
+                            #In prefill phase, hidden_cache_use_input = hidden_cache_use_tot = 
+                            #hidden_cache_store_tot
+                            num_tot_tokens += 1
+                            block_number = block_table[i // self.block_size]
+                            block_offset = i % self.block_size
+                            slot = block_number * self.block_size + block_offset
+                            slot_mapping.append(slot)
+                            #why there is no corresponding code for slot_mapping_shared?
+                            #Because prefill stage does not need shared_cache_writing (flash_attn.py)
+                            
+                    else: #request with kv cache required.
+                        num_tot_tokens += 1
+                        hidden_cache_use_input.append(False)
+                        if not is_prompt: #decode
+                            hidden_cache_use_tot.append(False)
+                        #hidden_holder_upd.append(False)
+                            hidden_holder_upd.append(True)
+                        block_number = block_table[i // self.block_size]
+                        block_offset = i % self.block_size
+                        slot = block_number * self.block_size + block_offset
+                        slot_mapping.append(slot)
+                        
 
         batch_size = len(input_tokens)
         max_query_len = max(query_lens)
@@ -537,10 +608,107 @@ class ModelRunner:
                 device=self.device,
             )
         assert max_query_len > 0, ("query_lens: {}".format(query_lens))
+        
+        #New here.
+        idx_cache_use_input = torch.arange(len(hidden_cache_use_input),
+                                                      dtype=torch.long,
+                                                      device=self.device)
+        
+        if not is_prompt: #decode
+            #idx initialization.
+            idx_cache_use_tot = torch.arange(len(hidden_cache_use_tot),
+                                             dtype=torch.long,
+                                             device=self.device)
+            
+            hidden_cache_use_tot = torch.tensor(hidden_cache_use_tot,
+                                                dtype=torch.bool, #careful here.
+                                                device=self.device)
+            
+            hidden_cache_use_input = torch.tensor(hidden_cache_use_input,
+                                                dtype=torch.bool, #careful here.
+                                                device=self.device)
+            
+            hidden_holder_upd = torch.tensor(hidden_holder_upd,
+                                             dtype=torch.bool,#careful here.
+                                             #dtype=torch.long,
+                                             device=self.device)
+            
+            hidden_cache_store_tot = hidden_cache_use_tot & hidden_holder_upd   
+            
+            hidden_cache_store_tot = idx_cache_use_tot[hidden_cache_store_tot]
+            
+            kv_cache_use_tot = ~hidden_cache_use_tot
+            hidden_cache_use_tot = idx_cache_use_tot[hidden_cache_use_tot]
+            kv_cache_use_tot = idx_cache_use_tot[kv_cache_use_tot]
+            
+            hidden_cache_use_input = idx_cache_use_input[hidden_cache_use_input] 
+            
+            hidden_holder_pull = ~hidden_holder_upd
+            hidden_holder_upd = idx_cache_use_tot[hidden_holder_upd]
+            hidden_holder_pull = idx_cache_use_tot[hidden_holder_pull]
+            
+            
+        else: #prefill 
+            #prefill actually only utilize hidden_cache_use_input, and kv_cache_use_tot,
+            #and hidden_cache_use_input = hidden_cache_use_tot
+            hidden_cache_use_input = torch.tensor(hidden_cache_use_input,
+                                                dtype=torch.bool, #careful here.
+                                                device=self.device)
+            kv_cache_use_tot = ~hidden_cache_use_input
+            kv_cache_use_tot = idx_cache_use_input[kv_cache_use_tot]
+            hidden_cache_use_input = idx_cache_use_input[hidden_cache_use_input]
+            hidden_cache_use_tot = hidden_cache_use_input
+            
+            hidden_cache_store_tot = hidden_cache_use_input
+            hidden_holder_upd = torch.tensor(hidden_holder_upd,
+                                             dtype=torch.long,
+                                             device=self.device) #null-element tensor.
+            hidden_holder_pull = hidden_holder_upd
+        
+        num_hidden_cache_tokens = len(hidden_cache_use_input)
 
+#         print('len(hidden_cache_use_tot)', len(hidden_cache_use_tot))
+#         print('len(kv_cache_use_tot)',len(kv_cache_use_tot))
+#         print('len(slot_mapping)', len(slot_mapping))
+#         print('num_prefill_tokens',num_prefill_tokens)
+#         print('num_decode_tokens',num_decode_tokens)
+#         print('num_tot_tokens',num_tot_tokens)
+#         print('len(hidden_cache_use_tot)+len(kv_cache_use_tot) == num_tot_tokens', \
+#               len(hidden_cache_use_tot)+len(kv_cache_use_tot) == num_tot_tokens)
+#         print('len(slot_mapping)==num_tot_tokens', len(slot_mapping)==num_tot_tokens)
+#         print('kv_cache_use_tot >= len(slot_mapping)', torch.sum(kv_cache_use_tot >= len(slot_mapping)))
+#         if is_prompt:
+#              print('num_prefill_tokens+num_decode_tokens==num_tot_tokens',\
+#               num_prefill_tokens+num_decode_tokens==num_tot_tokens)
+#         if not is_prompt:
+#             print('len(hidden_holder_upd)', len(hidden_holder_upd))
+#             print('len(hidden_holder_pull)',len(hidden_holder_pull))
+#             print('len(hidden_holder_upd) == num_decode_tokens', \
+#                   len(hidden_holder_upd) == num_decode_tokens)
+#             print('len(hidden_holder_upd)+len(hidden_holder_pull) == num_tot_tokens',\
+#                   len(hidden_holder_upd)+len(hidden_holder_pull) == num_tot_tokens)
+#             print('num_hidden_cache_tokens', num_hidden_cache_tokens)
+#             print('len(hidden_holder_upd) == len(idx_cache_use_input)',\
+#                   len(hidden_holder_upd) == len(idx_cache_use_input))
+#             if num_hidden_cache_tokens != 0:
+#                 print('len(slot_mapping_shared)', len(slot_mapping_shared))
+#                 print('len(slot_mapping_shared) == len(hidden_holder_pull)+num_hidden_cache_tokens', len(slot_mapping_shared) == len(hidden_holder_pull)+num_hidden_cache_tokens)
+#         print('\n')
+                
+#             slot_mapping_shared=slot_mapping_shared_tensor,
+#             hidden_cache_use_tot=hidden_cache_use_tot,
+#             kv_cache_use_tot=kv_cache_use_tot,
+#             hidden_cache_use_input=hidden_cache_use_input,
+#             #kv_cache_use_input=kv_cache_use_input, #no use, removed.
+#             hidden_holder_upd=hidden_holder_upd,
+#             hidden_holder_pull=hidden_holder_pull,
+        #########################################
+                                              
         seq_lens_tensor = torch.tensor(seq_lens,
                                        dtype=torch.int,
                                        device=self.device)
+        
+        
         seq_start_loc = torch.zeros(seq_lens_tensor.shape[0] + 1,
                                     dtype=torch.int32,
                                     device=self.device)
@@ -557,6 +725,10 @@ class ModelRunner:
                                               dtype=torch.long,
                                               device=self.device)
         slot_mapping_tensor = torch.tensor(slot_mapping,
+                                           dtype=torch.long,
+                                           device=self.device)
+        #new here.
+        slot_mapping_shared_tensor = torch.tensor(slot_mapping_shared,
                                            dtype=torch.long,
                                            device=self.device)
 
@@ -615,8 +787,20 @@ class ModelRunner:
             attn_metadata = self.attn_backend.make_metadata(
                 num_prefills=num_prefills,
                 slot_mapping=slot_mapping_tensor,
+                ###new traits here.###
+                slot_mapping_shared=slot_mapping_shared_tensor,
+                hidden_cache_use_tot=hidden_cache_use_tot,
+                kv_cache_use_tot=kv_cache_use_tot,
+                hidden_cache_use_input=hidden_cache_use_input,
+                hidden_cache_store_tot=hidden_cache_store_tot,
+                #kv_cache_use_input=kv_cache_use_input, #no use, removed.
+                hidden_holder_upd=hidden_holder_upd,
+                hidden_holder_pull=hidden_holder_pull,
+                num_tot_tokens = num_tot_tokens,
+                ###
                 num_prefill_tokens=num_prefill_tokens,
                 num_decode_tokens=num_decode_tokens,
+                num_hidden_cache_tokens=num_hidden_cache_tokens,
                 seq_lens=seq_lens,
                 seq_lens_tensor=seq_lens_tensor,
                 max_query_len=max_query_len,
@@ -729,6 +913,7 @@ class ModelRunner:
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
         kv_caches: List[torch.Tensor],
+        shared_cache: torch.Tensor,
     ) -> Optional[SamplerOutput]:
         (input_tokens, input_positions, attn_metadata, sampling_metadata,
          lora_requests, lora_mapping, multi_modal_kwargs
@@ -750,6 +935,7 @@ class ModelRunner:
             input_ids=input_tokens,
             positions=input_positions,
             kv_caches=kv_caches,
+            shared_cache=shared_cache,
             attn_metadata=attn_metadata,
             **multi_modal_kwargs,
         )
@@ -829,9 +1015,11 @@ class ModelRunner:
             seq = SequenceGroupMetadata(
                 request_id=str(group_id),
                 is_prompt=True,
+                use_hidden=False,
                 seq_data={group_id: seq_data},
                 sampling_params=sampling_params,
                 block_tables=None,
+                block_tables_4_shared=None,
                 lora_request=dummy_lora_requests_per_seq[group_id]
                 if dummy_lora_requests_per_seq else None,
                 multi_modal_data=dummy_multi_modal_data,
@@ -841,7 +1029,8 @@ class ModelRunner:
         # Run the model with the dummy inputs.
         num_layers = self.model_config.get_num_layers(self.parallel_config)
         kv_caches = [None] * num_layers
-        self.execute_model(seqs, kv_caches)
+        shared_cache = None
+        self.execute_model(seqs, kv_caches, shared_cache)
         torch.cuda.synchronize()
         return
 

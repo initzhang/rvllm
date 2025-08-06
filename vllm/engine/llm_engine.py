@@ -39,6 +39,12 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
 from vllm.utils import Counter
 from vllm.version import __version__ as VLLM_VERSION
 
+import torch.nn.functional as F
+from sklearn.linear_model import LinearRegression
+import torch
+import numpy as np
+import time
+
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
 
@@ -231,7 +237,10 @@ class LLMEngine:
             speculative_config=speculative_config,
             load_config=load_config,
         )
-
+        
+        coef = self._get_coef()
+    
+        
         if not self.model_config.embedding_mode:
             self._initialize_kv_caches()
 
@@ -279,6 +288,7 @@ class LLMEngine:
         # NOTE: the cache_config here have been updated with the numbers of
         # GPU and CPU blocks, which are profiled in the distributed executor.
         self.scheduler = Scheduler(scheduler_config, cache_config, lora_config)
+        self.scheduler.coef = coef
 
         # Metric Logging.
         if self.log_stats:
@@ -302,7 +312,49 @@ class LLMEngine:
                     self.get_tokenizer_for_seq,
                 ),
             ))
-
+    
+    def _get_coef(self) -> None:
+        print('Derive profit coefficient for scheduling...')
+        t_start = time.time()
+        time_stats = []
+        w_kv_shape = self.model_executor.driver_worker.model_runner.model.model.\
+        decoder.layers[0].self_attn.qkv_proj.weight.shape
+        num_layer = len(self.model_executor.driver_worker.model_runner.model.model.decoder.layers)
+        w_kv = torch.randn(w_kv_shape).cuda()
+        torch.cuda.synchronize()
+        
+        for num_tokens in range(1, 4101, 100):
+            x = torch.randn(num_tokens, w_kv_shape[1]).cuda()
+            torch.cuda.synchronize()
+            t0 = time.time()
+            for i in range(num_layer):
+                output = F.linear(x, w_kv, None)
+            torch.cuda.synchronize()
+            t1 = time.time()
+            time_stats.append(t1-t0)
+            
+        x = list(range(1, 4101,100))
+        x = [0] + x
+        x = np.array(x)
+        x = x//self.cache_config.block_size
+        x[1:][x[1:]==0] = 1
+        time_stats = [0] + time_stats
+        time_stats = np.array(time_stats)
+        
+        linear_model = LinearRegression()
+        linear_model.fit(x.reshape(-1,1), time_stats)
+        coef = linear_model.coef_[0]/5
+        
+        #post process
+        del w_kv, x, output, time_stats, linear_model
+        torch.cuda.empty_cache()
+        t_end = time.time()
+        print('Got profit coefficient:{}. Time taken:{:.2f}s'.format(coef, t_end-t_start))
+        
+        return coef
+        
+        
+    
     def _initialize_kv_caches(self) -> None:
         """Initialize the KV cache in the worker(s).
 
@@ -763,6 +815,7 @@ class LLMEngine:
             >>>         break
         """
         seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
+        #seq_group_metadata_list, scheduler_outputs, is_prompt = self.scheduler.schedule()
 
         if not scheduler_outputs.is_empty():
             execute_model_req = ExecuteModelRequest(
@@ -792,8 +845,9 @@ class LLMEngine:
             # the RPC thread in the workers so that they can process any other
             # queued control plane messages, such as add/remove lora adapters.
             self.model_executor.stop_remote_worker_execution_loop()
-
+        
         return request_outputs
+        #return request_outputs, is_prompt
 
     def do_log_stats(
             self,

@@ -89,6 +89,7 @@ class Worker(WorkerBase):
         self.cache_engine: CacheEngine
         # Initialize gpu_cache as embedding models don't initialize kv_caches
         self.gpu_cache: Optional[List[torch.tensor]] = None
+        self.shared_cache: Optional[torch.tensor] = None
 
     def init_device(self) -> None:
         if self.device_config.device.type == "cuda":
@@ -207,6 +208,7 @@ class Worker(WorkerBase):
         self.cache_engine = CacheEngine(self.cache_config, self.model_config,
                                         self.parallel_config)
         self.gpu_cache = self.cache_engine.gpu_cache
+        self.shared_cache = self.cache_engine.shared_cache
 
     def _warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:
@@ -278,7 +280,7 @@ class Worker(WorkerBase):
             return []
 
         output = self.model_runner.execute_model(seq_group_metadata_list,
-                                                 self.gpu_cache)
+                                                 self.gpu_cache, self.shared_cache)
 
         # Worker only supports single-step execution. Wrap the output in a list
         # to conform to interface.
@@ -314,7 +316,7 @@ class Worker(WorkerBase):
         if num_seq_groups == 0:
             return False
 
-        self.model_runner.execute_model(None, self.gpu_cache)
+        self.model_runner.execute_model(None, self.gpu_cache, self.shared_cache)
         return True
 
     def add_lora(self, lora_request: LoRARequest) -> bool:

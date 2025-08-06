@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
+import math
 
 from vllm.block import LogicalTokenBlock
 from vllm.inputs import LLMInputs
@@ -228,6 +229,7 @@ class Sequence:
     ) -> None:
         self.seq_id = seq_id
         self.inputs = inputs
+        self.use_hidden = False
         self.block_size = block_size
         self.eos_token_id = eos_token_id
         self.lora_request = lora_request
@@ -247,7 +249,15 @@ class Sequence:
         self.read_offset = 0
         # Input + output tokens
         self.tokens: Optional[List[str]] = None
-
+    
+    @property
+    def n_blocks(self) -> int:
+        return math.ceil(self.get_len() / self.block_size)
+    
+    @property
+    def n_blocks_upd(self) -> int:
+        return math.ceil((self.get_len()+1) / self.block_size)
+    
     @property
     def prompt(self) -> Optional[str]:
         return self.inputs.get("prompt")
@@ -441,6 +451,8 @@ class SequenceGroup:
         self.embeddings = embeddings
         self.pooling_params = pooling_params
         self.encoder_seq = encoder_seq
+        self.use_hidden = False
+        self.recompute_flag = False
 
     @property
     def prompt(self) -> Optional[str]:
@@ -453,7 +465,16 @@ class SequenceGroup:
         # All sequences in the group should have the same prompt.
         # We use the prompt of an arbitrary sequence.
         return next(iter(self.seqs_dict.values())).prompt_token_ids
-
+    
+    #@property
+    def set_use_hidden(self):
+        self.use_hidden = True
+        for key in self.seqs_dict.keys():
+            self.seqs_dict[key].use_hidden = True
+    
+    def set_preempt(self):
+        self.require_preempt = True
+    
     @property
     def multi_modal_data(self) -> Optional["MultiModalData"]:
         # All sequences in the group should have the same multi-modal data.
@@ -628,9 +649,11 @@ class SequenceGroupMetadata:
         self,
         request_id: str,
         is_prompt: bool,
+        use_hidden: bool,
         seq_data: Dict[int, SequenceData],
         sampling_params: SamplingParams,
         block_tables: Dict[int, List[int]],
+        block_tables_4_shared: Dict[int, List[int]],
         do_sample: bool = True,
         pooling_params: Optional[PoolingParams] = None,
         token_chunk_size: Optional[int] = None,
@@ -643,9 +666,11 @@ class SequenceGroupMetadata:
     ) -> None:
         self.request_id = request_id
         self.is_prompt = is_prompt
+        self.use_hidden = use_hidden
         self.seq_data = seq_data
         self.sampling_params = sampling_params
         self.block_tables = block_tables
+        self.block_tables_4_shared = block_tables_4_shared
         self.pooling_params = pooling_params
         self.lora_request = lora_request
         self.computed_block_nums = computed_block_nums

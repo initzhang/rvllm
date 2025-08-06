@@ -55,7 +55,7 @@ class CacheEngine:
         )
 
         # Initialize the cache.
-        self.gpu_cache = self._allocate_kv_cache(self.num_gpu_blocks, "cuda")
+        self.gpu_cache, self.shared_cache = self._allocate_kv_cache(self.num_gpu_blocks, "cuda")
         self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
 
     def _allocate_kv_cache(
@@ -68,6 +68,7 @@ class CacheEngine:
             num_blocks, self.block_size, self.num_kv_heads, self.head_size)
         pin_memory = is_pin_memory_available() if device == "cpu" else False
         kv_cache: List[torch.Tensor] = []
+        
         for _ in range(self.num_layers):
             # null block in CpuGpuBlockAllocator requires at least that
             # block to be zeroed-out.
@@ -77,7 +78,12 @@ class CacheEngine:
                             dtype=self.dtype,
                             pin_memory=pin_memory,
                             device=device))
-        return kv_cache
+        shared_cache_shape = (kv_cache_shape[0], 2*kv_cache_shape[1],) + kv_cache_shape[2:]
+        shared_cache = torch.zeros(shared_cache_shape,
+                            dtype=self.dtype,
+                            pin_memory=pin_memory,
+                            device=device)
+        return kv_cache, shared_cache
 
     def swap_in(self, src_to_dst: torch.Tensor) -> None:
         for i in range(self.num_layers):

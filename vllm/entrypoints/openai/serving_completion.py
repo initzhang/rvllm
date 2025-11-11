@@ -18,6 +18,7 @@ from vllm.entrypoints.openai.protocol import (CompletionLogProbs,
                                               CompletionResponse,
                                               CompletionResponseChoice,
                                               CompletionResponseStreamChoice,
+                                              RelCompletionStreamResponse,
                                               CompletionStreamResponse,
                                               ErrorResponse,
                                               RequestResponseMetadata,
@@ -143,6 +144,7 @@ class OpenAIServingCompletion(OpenAIServing):
                                  self._get_trace_headers(raw_request.headers))
 
                 if isinstance(sampling_params, BeamSearchParams):
+                    raise NotImplementedError
                     generator = self.engine_client.beam_search(
                         prompt=engine_prompt,
                         request_id=request_id,
@@ -157,6 +159,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         prompt_adapter_request=prompt_adapter_request,
                         trace_headers=trace_headers,
                         priority=request.priority,
+                        rel_id=request.rel_id,
                     )
 
                 generators.append(generator)
@@ -359,12 +362,26 @@ class OpenAIServingCompletion(OpenAIServing):
                 total_tokens=total_prompt_tokens + total_completion_tokens)
 
             if include_usage:
-                final_usage_chunk = CompletionStreamResponse(
+                # fetch some statistics from res [RequestOutput]'s metrics field
+                """
+                definition: vllm/sequence.py LINE 98
+                transferred: arrival_time, last_token_time, first_scheduled_time, first_token_time, time_in_queue, 
+                unused: finished_time, scheduler_time
+                """
+                final_usage_chunk = RelCompletionStreamResponse(
                     id=request_id,
                     created=created_time,
                     model=model_name,
                     choices=[],
                     usage=final_usage_info,
+                    arrival_time=res.metrics.arrival_time,
+                    last_token_time=res.metrics.last_token_time,
+                    first_scheduled_time=res.metrics.first_scheduled_time,
+                    first_token_time=res.metrics.first_token_time,
+                    time_in_queue=res.metrics.time_in_queue,
+                    finished_time=res.metrics.finished_time,
+                    scheduler_time=res.metrics.scheduler_time,
+                    num_cached_tokens=res.num_cached_tokens
                 )
                 final_usage_data = (final_usage_chunk.model_dump_json(
                     exclude_unset=False, exclude_none=True))

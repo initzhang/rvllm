@@ -438,6 +438,7 @@ class _AsyncLLMEngine(LLMEngine):
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        rel_id: int = -1,
     ) -> None:
         ...
 
@@ -452,6 +453,7 @@ class _AsyncLLMEngine(LLMEngine):
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        rel_id: int = -1,
     ) -> None:
         ...
 
@@ -469,6 +471,7 @@ class _AsyncLLMEngine(LLMEngine):
             trace_headers: Optional[Mapping[str, str]] = None,
             prompt_adapter_request: Optional[PromptAdapterRequest] = None,
             priority: int = 0,
+            rel_id: int = -1,
             *,
             inputs: Optional[PromptType] = None,  # DEPRECATED
     ) -> None:
@@ -520,6 +523,7 @@ class _AsyncLLMEngine(LLMEngine):
             prompt_adapter_request=prompt_adapter_request,
             trace_headers=trace_headers,
             priority=priority,
+            rel_id=rel_id
         )
 
     async def check_health_async(self) -> None:
@@ -857,6 +861,7 @@ class AsyncLLMEngine(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        rel_id: int = -1,
     ) -> Coroutine[None, None, AsyncGenerator[Union[
             RequestOutput, PoolingRequestOutput], None]]:
         ...
@@ -872,6 +877,7 @@ class AsyncLLMEngine(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        rel_id: int = -1,
     ) -> Coroutine[None, None, AsyncGenerator[Union[
             RequestOutput, PoolingRequestOutput], None]]:
         ...
@@ -890,6 +896,7 @@ class AsyncLLMEngine(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        rel_id: int = -1,
         *,
         inputs: Optional[PromptType] = None,  # DEPRECATED
     ) -> AsyncGenerator[Union[RequestOutput, PoolingRequestOutput], None]:
@@ -922,6 +929,7 @@ class AsyncLLMEngine(EngineClient):
             trace_headers=trace_headers,
             prompt_adapter_request=prompt_adapter_request,
             priority=priority,
+            rel_id=rel_id,
         )
 
         return stream.generator()
@@ -935,6 +943,7 @@ class AsyncLLMEngine(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        rel_id: int = -1,
     ) -> AsyncGenerator[RequestOutput, None]:
         """Generate outputs for a request.
 
@@ -1011,6 +1020,7 @@ class AsyncLLMEngine(EngineClient):
                     trace_headers=trace_headers,
                     prompt_adapter_request=prompt_adapter_request,
                     priority=priority,
+                    rel_id=rel_id,
             ):
                 yield LLMEngine.validate_output(output, RequestOutput)
         except asyncio.CancelledError:
@@ -1088,6 +1098,7 @@ class AsyncLLMEngine(EngineClient):
             >>> # Process and return the final output
             >>> ...
         """
+        raise NotImplementedError
         try:
             async for output in await self.add_request(
                     request_id,
